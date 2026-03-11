@@ -3,7 +3,9 @@ use base64::Engine;
 
 use crate::couchdb::CouchDBClient;
 use crate::crypto;
-use crate::doc::{NoteEntry, RawNoteEntry, ENCRYPTED_META_PREFIX, EDEN_ENCRYPTED_KEY, EDEN_ENCRYPTED_KEY_HKDF};
+use std::collections::HashMap;
+
+use crate::doc::{EdenChunk, NoteEntry, RawNoteEntry, ENCRYPTED_META_PREFIX, EDEN_ENCRYPTED_KEY, EDEN_ENCRYPTED_KEY_HKDF};
 
 /// Encryption context for decrypting E2EE-protected data.
 ///
@@ -29,7 +31,8 @@ impl E2EEContext {
 /// Resolve a `RawNoteEntry` from CouchDB into a fully decoded `NoteEntry`.
 ///
 /// If E2EE is enabled (path starts with `/\:`), decrypts the metadata to
-/// extract the real path, timestamps, and children list.
+/// extract the real path, timestamps, and children list. Also decrypts the
+/// eden field if it contains an encrypted sentinel key.
 pub fn resolve_note(
     raw: &RawNoteEntry,
     e2ee: Option<&E2EEContext>,
@@ -51,6 +54,11 @@ pub fn resolve_note(
             meta.children
         };
 
+        // When E2EE is enabled, the entire eden object is encrypted as a
+        // single JSON blob under a sentinel key. Decrypt it back into the
+        // original chunk map so reassemble() can look up chunks by ID.
+        let eden = decrypt_eden(&raw.eden, &ctx.master_key, &ctx.passphrase)?;
+
         Ok(NoteEntry {
             id: raw._id.clone(),
             rev: raw._rev.clone(),
@@ -59,7 +67,7 @@ pub fn resolve_note(
             mtime: meta.mtime,
             size: meta.size,
             children,
-            eden: raw.eden.clone(),
+            eden,
             deleted,
             is_binary: raw.is_binary(),
         })
@@ -77,6 +85,31 @@ pub fn resolve_note(
             is_binary: raw.is_binary(),
         })
     }
+}
+
+/// Decrypt the eden field if it contains an encrypted sentinel key.
+///
+/// When E2EE is enabled, the plugin encrypts the entire eden object
+/// (`JSON.stringify(eden)`) into a single blob stored under a sentinel key
+/// (`h:++encrypted-hkdf` or `h:++encrypted`). This function detects the
+/// sentinel, decrypts the blob, and parses it back into the original chunk map.
+fn decrypt_eden(
+    eden: &HashMap<String, EdenChunk>,
+    master_key: &[u8; 32],
+    passphrase: &str,
+) -> anyhow::Result<HashMap<String, EdenChunk>> {
+    let sentinel_data = eden
+        .get(EDEN_ENCRYPTED_KEY_HKDF)
+        .or_else(|| eden.get(EDEN_ENCRYPTED_KEY));
+
+    let Some(sentinel) = sentinel_data else {
+        // No sentinel key — eden is not encrypted (or empty).
+        return Ok(eden.clone());
+    };
+
+    let json_str = crypto::decrypt_string(&sentinel.data, master_key, passphrase)?;
+    let decrypted: HashMap<String, EdenChunk> = serde_json::from_str(&json_str)?;
+    Ok(decrypted)
 }
 
 /// Reassemble file content from chunk documents.
@@ -100,20 +133,11 @@ pub async fn reassemble(
     let mut chunk_data: Vec<Option<String>> = vec![None; entry.children.len()];
     let mut fetch_ids: Vec<(usize, String)> = Vec::new();
 
+    // Eden is already decrypted by resolve_note(), so chunk IDs can be
+    // looked up directly regardless of E2EE mode.
     for (i, child_id) in entry.children.iter().enumerate() {
         if let Some(eden_chunk) = entry.eden.get(child_id) {
-            // Direct match by chunk ID.
             chunk_data[i] = Some(eden_chunk.data.clone());
-        } else if e2ee.is_some() {
-            // When E2EE is enabled, encrypted eden chunks may be stored under
-            // sentinel keys instead of the regular chunk ID.
-            if let Some(eden_chunk) = entry.eden.get(EDEN_ENCRYPTED_KEY_HKDF)
-                .or_else(|| entry.eden.get(EDEN_ENCRYPTED_KEY))
-            {
-                chunk_data[i] = Some(eden_chunk.data.clone());
-            } else {
-                fetch_ids.push((i, child_id.clone()));
-            }
         } else {
             fetch_ids.push((i, child_id.clone()));
         }

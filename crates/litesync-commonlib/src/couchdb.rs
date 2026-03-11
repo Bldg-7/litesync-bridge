@@ -115,11 +115,15 @@ impl CouchDBClient {
         }
 
         let result: AllDocsResponse = resp.json().await?;
-        let chunks = result
-            .rows
-            .into_iter()
-            .filter_map(|row| row.doc)
-            .collect();
+        let mut chunks = Vec::with_capacity(result.rows.len());
+        for row in result.rows {
+            if let Some(error) = row.error {
+                anyhow::bail!("failed to fetch chunk {}: {}", row.id, error);
+            }
+            if let Some(doc) = row.doc {
+                chunks.push(doc);
+            }
+        }
 
         Ok(chunks)
     }

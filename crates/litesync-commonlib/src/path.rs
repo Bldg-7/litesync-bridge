@@ -29,7 +29,7 @@ pub fn path2id(path: &str, obfuscate_passphrase: Option<&str>) -> String {
     }
 
     let hashed_passphrase = hash_string_chain(passphrase);
-    let id_hash = sha256_hex(&format!("{hashed_passphrase}:{path}"));
+    let id_hash = sha256_hex(&format!("{hashed_passphrase}:{normalized}"));
 
     format!("{prefix}{PREFIX_OBFUSCATED}{id_hash}")
 }
