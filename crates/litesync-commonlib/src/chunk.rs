@@ -8,7 +8,8 @@ use std::collections::HashMap;
 
 use crate::doc::{
     EdenChunk, EntryLeaf, NoteEntry, RawNoteEntry, ENCRYPTED_META_PREFIX,
-    EDEN_ENCRYPTED_KEY, EDEN_ENCRYPTED_KEY_HKDF, PREFIX_CHUNK, TYPE_LEAF,
+    EDEN_ENCRYPTED_KEY, EDEN_ENCRYPTED_KEY_HKDF, PREFIX_CHUNK, PREFIX_ENCRYPTED_CHUNK,
+    TYPE_LEAF,
 };
 
 /// Encryption context for decrypting E2EE-protected data.
@@ -312,19 +313,21 @@ fn hash_passphrase_for_chunks(passphrase: &str) -> String {
 /// Where `hashedPassphrase` is MurmurHash3+FNV-1a of `SALT_OF_ID + passphrase[0..75%]`.
 /// The `piece_utf16_len` uses UTF-16 code unit count to match JS `piece.length`.
 ///
-/// The returned ID includes the `h:` prefix (e.g., `"h:1a2b3c"`).
+/// The returned ID uses the `h:+` prefix when E2EE is enabled (passphrase provided),
+/// or the `h:` prefix otherwise, matching the TS plugin's `HashManagerCore.computeHash`
+/// behavior where encrypted hashes include a `"+"` discriminator.
 pub fn chunk_id(piece: &str, passphrase: Option<&str>) -> String {
     let piece_utf16_len: usize = piece.chars().map(|c| c.len_utf16()).sum();
 
-    let hash_input = if let Some(pp) = passphrase {
+    let (prefix, hash_input) = if let Some(pp) = passphrase {
         let hashed_pp = hash_passphrase_for_chunks(pp);
-        format!("{}-{}-{}", piece, hashed_pp, piece_utf16_len)
+        (PREFIX_ENCRYPTED_CHUNK, format!("{}-{}-{}", piece, hashed_pp, piece_utf16_len))
     } else {
-        format!("{}-{}", piece, piece_utf16_len)
+        (PREFIX_CHUNK, format!("{}-{}", piece, piece_utf16_len))
     };
 
     let hash = xxhash_rust::xxh64::xxh64(hash_input.as_bytes(), 0);
-    format!("{}{}", PREFIX_CHUNK, u64_to_base36(hash))
+    format!("{}{}", prefix, u64_to_base36(hash))
 }
 
 fn u64_to_base36(mut n: u64) -> String {
@@ -841,7 +844,7 @@ mod tests {
     fn test_chunk_id_with_passphrase() {
         let piece = "SGVsbG8=";
         let id = chunk_id(piece, Some("my-passphrase"));
-        assert!(id.starts_with("h:"));
+        assert!(id.starts_with("h:+"), "E2EE chunk ID should start with 'h:+', got: {id}");
         // Different from without passphrase
         assert_ne!(id, chunk_id(piece, None));
     }
@@ -867,6 +870,27 @@ mod tests {
         let id1 = chunk_id(piece, Some("completely-different-alpha"));
         let id2 = chunk_id(piece, Some("something-else-entirely-beta"));
         assert_ne!(id1, id2);
+    }
+
+    #[test]
+    fn test_chunk_id_prefix_matches_ts_plugin() {
+        // TS plugin: HashManagerCore.computeHash returns "+" + hash when
+        // encryption is active. The caller prepends "h:", giving "h:+hash".
+        // Without encryption, the result is "h:hash" (no "+").
+        let piece = "test content for prefix check";
+
+        let plain_id = chunk_id(piece, None);
+        assert!(plain_id.starts_with("h:"), "plain chunk ID should start with 'h:'");
+        assert!(!plain_id.starts_with("h:+"), "plain chunk ID must NOT have '+' discriminator");
+
+        let encrypted_id = chunk_id(piece, Some("my-passphrase"));
+        assert!(encrypted_id.starts_with("h:+"), "encrypted chunk ID should start with 'h:+'");
+
+        // The hash portion (after prefix) should be different since the
+        // passphrase changes the hash input
+        let plain_hash = &plain_id[2..];
+        let encrypted_hash = &encrypted_id[3..];
+        assert_ne!(plain_hash, encrypted_hash);
     }
 
     // =====================================================================
@@ -1022,15 +1046,17 @@ mod tests {
         assert!(!result.chunks.is_empty());
         assert_eq!(result.chunks.len(), result.children.len());
 
-        // All chunk IDs start with "h:"
+        // All chunk IDs start with "h:" (plain, not encrypted "h:+")
         for child in &result.children {
-            assert!(child.starts_with("h:"));
+            assert!(child.starts_with("h:"), "chunk ID should start with 'h:', got: {child}");
+            assert!(!child.starts_with("h:+"), "non-E2EE chunk ID should NOT start with 'h:+', got: {child}");
         }
 
         // All chunks are leaf type
         for chunk in &result.chunks {
             assert_eq!(chunk.type_, "leaf");
             assert!(chunk._id.starts_with("h:"));
+            assert!(!chunk._id.starts_with("h:+"), "non-E2EE chunk should NOT have 'h:+' prefix");
         }
 
         // Reassemble: text chunks are raw text, concatenate directly
@@ -1076,9 +1102,15 @@ mod tests {
         let content = b"# Secret Note\n\nThis is encrypted.\n";
         let result = disassemble(content, "secret.md", 1000, Some(&ctx)).unwrap();
 
+        // All chunk IDs should use the encrypted prefix "h:+"
+        for child in &result.children {
+            assert!(child.starts_with("h:+"), "E2EE chunk ID should start with 'h:+', got: {child}");
+        }
+
         // All chunk data should be encrypted (starts with %=)
         for chunk in &result.chunks {
             assert!(chunk.data.starts_with("%="), "chunk data should be encrypted");
+            assert!(chunk._id.starts_with("h:+"), "E2EE chunk _id should start with 'h:+', got: {}", chunk._id);
         }
 
         // Decrypt and reassemble to verify roundtrip

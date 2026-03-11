@@ -193,18 +193,43 @@ impl CouchDBClient {
         self.get_changes("0", None).await
     }
 
-    /// Fetch the PBKDF2 salt from the LiveSync config document.
+    /// Fetch the PBKDF2 salt from the LiveSync sync parameters document.
     ///
-    /// Self-hosted LiveSync stores the E2EE salt in `_local/obsidian-livesync-config`
-    /// (or `_local/obsidian-livesync`) under the `encryptedPassphraseSalt` field.
+    /// Self-hosted LiveSync stores the E2EE salt in
+    /// `_local/obsidian_livesync_sync_parameters` under the `pbkdf2salt` field
+    /// as a base64-encoded string (matching the Obsidian plugin's
+    /// `DOCID_SYNC_PARAMETERS`).
+    ///
+    /// For legacy databases that predate the sync-parameters document, we fall
+    /// back to `_local/obsidian-livesync-config` / `_local/obsidian-livesync`
+    /// which stored the salt as a hex string in `encryptedPassphraseSalt`.
     pub async fn get_e2ee_salt(&self) -> anyhow::Result<Vec<u8>> {
-        // Try the modern config document first, then the legacy one.
-        let config_ids = [
+        use base64::engine::general_purpose::STANDARD as BASE64;
+        use base64::Engine;
+
+        // 1. Try the current sync-parameters document (matches TS plugin).
+        {
+            let config_id = "_local/obsidian_livesync_sync_parameters";
+            let url = format!("{}/{}", self.db_url(), urlencoding::encode(config_id));
+            let resp = self.client.get(&url).send().await?;
+            if resp.status().is_success() {
+                let doc: serde_json::Value = resp.json().await?;
+                if let Some(salt_b64) = doc.get("pbkdf2salt").and_then(|v| v.as_str()) {
+                    if !salt_b64.is_empty() {
+                        return BASE64.decode(salt_b64)
+                            .map_err(|e| anyhow::anyhow!("invalid PBKDF2 salt base64: {e}"));
+                    }
+                }
+            }
+        }
+
+        // 2. Legacy fallback: older config documents with hex-encoded salt.
+        let legacy_ids = [
             "_local/obsidian-livesync-config",
             "_local/obsidian-livesync",
         ];
 
-        for config_id in &config_ids {
+        for config_id in &legacy_ids {
             let url = format!("{}/{}", self.db_url(), urlencoding::encode(config_id));
             let resp = self.client.get(&url).send().await?;
             if !resp.status().is_success() {
