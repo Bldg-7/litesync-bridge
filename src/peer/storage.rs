@@ -250,12 +250,14 @@ impl StoragePeer {
 
                 tokio::fs::write(&full, &data).await?;
 
-                // Restore original mtime
+                // Restore original mtime — this fires a second notify event,
+                // so refresh the tracker timestamp afterward.
                 let ft = filetime::FileTime::from_unix_time(
                     (mtime / 1000) as i64,
                     ((mtime % 1000) * 1_000_000) as u32,
                 );
                 filetime::set_file_mtime(&full, ft)?;
+                self.write_tracker.record(full);
 
                 tracing::debug!(peer = %self.name, path = %path.display(), "wrote file");
             }
