@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use reqwest::header::{self, HeaderMap, HeaderValue};
 use reqwest::Client;
 use serde::de::DeserializeOwned;
@@ -26,6 +28,8 @@ impl CouchDBClient {
         default_headers.insert(header::AUTHORIZATION, auth_value);
 
         let client = Client::builder()
+            .connect_timeout(Duration::from_secs(10))
+            .timeout(Duration::from_secs(30))
             .danger_accept_invalid_certs(false)
             .default_headers(default_headers)
             .build()?;
