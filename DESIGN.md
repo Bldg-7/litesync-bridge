@@ -210,34 +210,90 @@ CouchDB에서 데이터를 읽어서 복호화할 수 있는 수준까지.
 
 **Milestone: 로컬 파일을 CouchDB에 업로드할 수 있음**
 
-### Phase 3: Bridge daemon
+### Phase 3-0: Bridge daemon (core)
 
 ```
-3.1  config.rs — Config file parsing
-     - dat/config.json 호환 (기존 설정 재사용)
-     - 환경변수 override
+채널 아키텍처:
 
-3.2  peer/couchdb.rs — CouchDB peer
-     - _changes feed 소비 (continuous/long-polling)
-     - since 시퀀스 추적 + 영속화 (★ 기존 버그 수정)
-     - 변경 이벤트를 hub에 dispatch
+  CouchDBPeer ──tx──┐                          ┌──rx──→ CouchDBPeer
+                    │   Hub (group router)     │
+  StoragePeer ──tx──┤                          ├──rx──→ StoragePeer
+                    └──────────────────────────┘
 
-3.3  peer/storage.rs — Filesystem peer
-     - notify crate로 파일 감시
-     - 오프라인 변경 스캔 (startup reconciliation)
-     - stat 추적 (mtime + size)으로 변경 감지
-
-3.4  hub.rs — Peer orchestration
-     - Group-based routing
-     - 양방향 reconciliation (★ 기존 부재 수정)
-     - Deduplication (content hash 기반)
-
-3.5  bridge.rs — Change event types
-     - Created / Modified / Deleted events
-     - 삭제 전파 시 _rev retry 로직 (★ 기존 부재 수정)
+  채널: tokio::sync::mpsc (bounded, cap=256)
+  셧다운: CancellationToken (tokio-util)
 ```
 
-**Milestone: 양방향 실시간 동기화 데몬 동작**
+```
+3.0.1  bridge.rs — 메시지 타입 확장
+       - PeerMessage { source_name, group, event }
+       - ChangeEvent::Modified { path, data, mtime, ctime, is_binary }
+       - ChangeEvent::Deleted { path }
+
+3.0.2  commonlib couchdb.rs — long-polling 지원
+       - get_changes_longpoll(since, timeout_ms)
+       - feed=longpoll&timeout={ms}, HTTP timeout = ms + 5s
+
+3.0.3  state.rs (신규) — 상태 영속화 + dedup
+       - since 영속화: dat/{peer-name}.since (텍스트 파일)
+       - StoragePeer dedup: HashSet<PathBuf> — 자기가 쓴 파일 추적
+       - CouchDBPeer dedup: HashSet<String> — 자기가 쓴 doc rev 추적
+
+3.0.4  peer/couchdb.rs — CouchDB peer
+       - 초기화: CouchDBClient + ping + E2EEContext (salt → master key)
+       - Changes loop: longpoll → resolve_note → reassemble → tx.send()
+       - Inbound loop: rx.recv() → disassemble → put_chunks → put_doc
+       - 삭제 처리: get_doc(_rev fetch) → delete_doc (★ 기존 버그 수정)
+       - since 추적: 매 batch 후 영속화 (★ 기존 버그 수정)
+       - 에러: 지수 백오프 재시도 (1s→2s→4s→...max 60s), 401은 fatal
+
+3.0.5  peer/storage.rs — Filesystem peer
+       - 초기화: baseDir 확인/생성 + notify::RecommendedWatcher
+       - Watcher loop: notify 이벤트 → debounce(100ms) → read → tx.send()
+       - Inbound loop: rx.recv() → create_dir_all → write → set_mtime
+       - should_be_ignored() 필터 적용
+       - 에러: 파일 I/O 실패 시 로그 후 skip
+
+3.0.6  hub.rs — Peer orchestration
+       - peer별 channel pair 생성 (outbound merge + inbound per-peer)
+       - peer task spawn (각 peer당 2 tasks: outbound + inbound)
+       - routing loop: group 기준, source 제외한 같은 group peer에 전달
+
+3.0.7  main.rs — Graceful shutdown
+       - CancellationToken 공유
+       - ctrl_c → cancel → 모든 peer task join
+       - --reset 플래그: since 파일 삭제
+```
+
+**추가 의존성:**
+```
+notify = "7"          # filesystem watcher
+tokio-util = "0.7"    # CancellationToken
+filetime = "0.2"      # set mtime on written files
+```
+
+**Milestone: 실시간 단방향(CouchDB→FS) + 역방향(FS→CouchDB) 동기화 동작**
+
+### Phase 3-1: Bidirectional reconciliation
+
+```
+3.1.1  startup reconciliation
+       - CouchDB: get_all_notes() → 전체 문서 목록
+       - Storage: 디렉토리 walk → 전체 파일 목록
+       - 양방향 diff: mtime 비교 기반 충돌 해결
+       - 누락 파일 감지 (한쪽에만 존재) → 동기화 또는 삭제 판정
+
+3.1.2  offline change scan (StoragePeer)
+       - stat 캐시: dat/{peer-name}.stats (path → "mtime-size")
+       - startup 시 현재 stat vs 캐시 비교 → 변경된 파일만 dispatch
+       - scanOfflineChanges config 옵션으로 on/off
+
+3.1.3  conflict resolution
+       - Last-write-wins (mtime 기준) 기본 전략
+       - 향후: conflict 파일 생성 옵션 (Phase 4)
+```
+
+**Milestone: 재시작 후에도 변경 유실 없는 완전한 양방향 동기화**
 
 ### Phase 4: Production readiness
 

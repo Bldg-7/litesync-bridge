@@ -15,6 +15,7 @@ use crate::doc::{
 ///
 /// The master key is derived once from the passphrase and PBKDF2 salt,
 /// avoiding repeated PBKDF2 (310k iterations) per chunk.
+#[derive(Clone)]
 pub struct E2EEContext {
     pub passphrase: String,
     pub pbkdf2_salt: Vec<u8>,

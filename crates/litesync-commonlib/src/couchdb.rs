@@ -132,6 +132,46 @@ impl CouchDBClient {
         Ok(chunks)
     }
 
+    /// Fetch changes using CouchDB long-polling.
+    ///
+    /// Blocks until at least one change is available or `timeout_ms` elapses.
+    /// The HTTP request timeout is set to `timeout_ms + 5000ms` to account
+    /// for network overhead.
+    pub async fn get_changes_longpoll(
+        &self,
+        since: &str,
+        timeout_ms: u64,
+    ) -> anyhow::Result<ChangesResponse> {
+        let url = format!(
+            "{}/_changes?include_docs=true&filter=_selector&feed=longpoll&timeout={}",
+            self.db_url(),
+            timeout_ms
+        );
+
+        let body = json!({
+            "selector": {
+                "type": { "$ne": TYPE_LEAF }
+            }
+        });
+
+        let resp = self
+            .client
+            .post(&url)
+            .query(&[("since", since)])
+            .timeout(Duration::from_millis(timeout_ms + 5_000))
+            .json(&body)
+            .send()
+            .await?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let text = resp.text().await.unwrap_or_default();
+            anyhow::bail!("_changes longpoll: {status} — {text}");
+        }
+
+        Ok(resp.json().await?)
+    }
+
     /// Fetch all note documents (non-leaf) from the database.
     pub async fn get_all_notes(&self) -> anyhow::Result<ChangesResponse> {
         self.get_changes("0", None).await

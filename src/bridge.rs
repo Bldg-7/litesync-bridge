@@ -7,6 +7,8 @@ pub enum ChangeEvent {
         path: PathBuf,
         data: Vec<u8>,
         mtime: u64,
+        ctime: u64,
+        is_binary: bool,
     },
     Deleted {
         path: PathBuf,
@@ -20,4 +22,12 @@ impl ChangeEvent {
             ChangeEvent::Deleted { path } => path,
         }
     }
+}
+
+/// Message sent from a peer to the Hub for routing.
+#[derive(Debug, Clone)]
+pub struct PeerMessage {
+    pub source_name: String,
+    pub group: String,
+    pub event: ChangeEvent,
 }
