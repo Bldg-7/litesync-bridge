@@ -103,10 +103,6 @@ impl StoragePeer {
             };
 
             for event_path in &event.paths {
-                if event_path.is_dir() {
-                    continue;
-                }
-
                 let rel = match event_path.strip_prefix(&self.base_dir) {
                     Ok(r) => r,
                     Err(_) => continue,
@@ -130,6 +126,10 @@ impl StoragePeer {
 
                 match event.kind {
                     EventKind::Create(_) | EventKind::Modify(_) => {
+                        // Skip directories (stat is valid here since the file still exists)
+                        if event_path.is_dir() {
+                            continue;
+                        }
                         match self.read_file(event_path, rel).await {
                             Ok(Some(change_event)) => {
                                 let msg = PeerMessage {
@@ -151,6 +151,12 @@ impl StoragePeer {
                         }
                     }
                     EventKind::Remove(_) => {
+                        // For Remove events, the path no longer exists so is_dir()
+                        // would always return false. Use lack of extension as a
+                        // heuristic to skip directory removals.
+                        if rel.extension().is_none() {
+                            continue;
+                        }
                         let msg = PeerMessage {
                             source_name: self.name.clone(),
                             group: self.group.clone(),
@@ -182,7 +188,11 @@ impl StoragePeer {
             Err(e) => return Err(e.into()),
         };
 
-        let data = tokio::fs::read(abs_path).await?;
+        let data = match tokio::fs::read(abs_path).await {
+            Ok(d) => d,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e.into()),
+        };
         let filename = rel_path.to_string_lossy();
         let is_binary = !lspath::is_plain_text(&filename);
 
@@ -256,7 +266,9 @@ impl StoragePeer {
                     (mtime / 1000) as i64,
                     ((mtime % 1000) * 1_000_000) as u32,
                 );
-                filetime::set_file_mtime(&full, ft)?;
+                let full_clone = full.clone();
+                tokio::task::spawn_blocking(move || filetime::set_file_mtime(&full_clone, ft))
+                    .await??;
                 self.write_tracker.record(full);
 
                 tracing::debug!(peer = %self.name, path = %path.display(), "wrote file");

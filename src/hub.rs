@@ -77,8 +77,17 @@ impl Hub {
                 if name != &msg.source_name
                     && peer_groups.get(name).map(String::as_str) == Some(&msg.group)
                 {
-                    if let Err(e) = tx.send(msg.event.clone()).await {
-                        tracing::warn!(target_peer = %name, "send failed: {e}");
+                    match tx.try_send(msg.event.clone()) {
+                        Ok(()) => {}
+                        Err(mpsc::error::TrySendError::Full(_)) => {
+                            tracing::warn!(
+                                target_peer = %name,
+                                "inbound channel full, dropping event"
+                            );
+                        }
+                        Err(mpsc::error::TrySendError::Closed(_)) => {
+                            tracing::warn!(target_peer = %name, "peer channel closed");
+                        }
                     }
                 }
             }

@@ -29,16 +29,16 @@ impl SinceTracker {
     }
 
     /// Update the sequence and persist to disk.
-    pub fn update(&mut self, seq: &serde_json::Value) -> anyhow::Result<()> {
+    pub async fn update(&mut self, seq: &serde_json::Value) -> anyhow::Result<()> {
         self.current = match seq {
             serde_json::Value::String(s) => s.clone(),
             serde_json::Value::Number(n) => n.to_string(),
             _ => seq.to_string(),
         };
         if let Some(parent) = self.path.parent() {
-            std::fs::create_dir_all(parent)?;
+            tokio::fs::create_dir_all(parent).await?;
         }
-        std::fs::write(&self.path, &self.current)?;
+        tokio::fs::write(&self.path, &self.current).await?;
         Ok(())
     }
 

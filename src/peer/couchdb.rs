@@ -30,6 +30,12 @@ fn is_not_found(err: &anyhow::Error) -> bool {
         .is_some_and(|e| e.status == 404)
 }
 
+/// Check if a relative path refers to a hidden file/directory.
+/// Matches the same convention as StoragePeer's watcher filter.
+fn is_hidden_path(rel_path: &str) -> bool {
+    rel_path.starts_with('.') || rel_path.contains("/.")
+}
+
 pub struct CouchDBPeer {
     name: String,
     group: String,
@@ -217,7 +223,7 @@ impl CouchDBPeer {
                         }
                     }
 
-                    since.update(&changes.last_seq)?;
+                    since.update(&changes.last_seq).await?;
                     if count > 0 {
                         tracing::debug!(
                             peer = %self.name, count,
@@ -259,7 +265,7 @@ impl CouchDBPeer {
             if let Ok(raw) = serde_json::from_value::<RawNoteEntry>(val.clone()) {
                 if let Ok(note) = chunk::resolve_note(&raw, self.e2ee.as_ref(), Some(true)) {
                     if let Some(rel) = self.apply_base_dir_filter(&note.path) {
-                        if !path::should_be_ignored(&rel) {
+                        if !path::should_be_ignored(&rel) && !is_hidden_path(&rel) {
                             return Some(rel);
                         }
                     }
@@ -270,7 +276,7 @@ impl CouchDBPeer {
         // Strategy 2: Try reversing the doc ID (works for non-obfuscated IDs)
         if let Ok(full_path) = path::id2path(doc_id, None) {
             if let Some(rel) = self.apply_base_dir_filter(&full_path) {
-                if !path::should_be_ignored(&rel) {
+                if !path::should_be_ignored(&rel) && !is_hidden_path(&rel) {
                     return Some(rel);
                 }
             }
@@ -303,21 +309,12 @@ impl CouchDBPeer {
     ) -> anyhow::Result<Option<ChangeEvent>> {
         let note = chunk::resolve_note(raw, self.e2ee.as_ref(), deleted)?;
 
-        // Filter by base_dir
-        if !self.base_dir.is_empty() && !note.path.starts_with(&self.base_dir) {
-            return Ok(None);
-        }
-
-        let rel_path = if self.base_dir.is_empty() {
-            note.path.clone()
-        } else {
-            note.path
-                .strip_prefix(&self.base_dir)
-                .unwrap_or(&note.path)
-                .to_string()
+        let rel_path = match self.apply_base_dir_filter(&note.path) {
+            Some(r) => r,
+            None => return Ok(None),
         };
 
-        if path::should_be_ignored(&rel_path) {
+        if path::should_be_ignored(&rel_path) || is_hidden_path(&rel_path) {
             return Ok(None);
         }
 
@@ -398,16 +395,21 @@ impl CouchDBPeer {
                 let doc_type = if is_binary { TYPE_NEWNOTE } else { TYPE_PLAIN };
 
                 for attempt in 0..MAX_CONFLICT_RETRIES {
-                    let existing_rev: Option<String> = self
+                    // Fetch existing doc for _rev and eden preservation
+                    let (existing_rev, existing_eden) = self
                         .client
                         .get_doc::<serde_json::Value>(&doc_id)
                         .await
                         .ok()
-                        .and_then(|doc| {
-                            doc.get("_rev")
+                        .map(|d| {
+                            let rev = d
+                                .get("_rev")
                                 .and_then(|v| v.as_str())
-                                .map(String::from)
-                        });
+                                .map(String::from);
+                            let eden = d.get("eden").cloned().unwrap_or(serde_json::json!({}));
+                            (rev, eden)
+                        })
+                        .unwrap_or((None, serde_json::json!({})));
 
                     // Build parent document (E2EE: encrypt_meta uses random IV each call,
                     // but decrypt produces the same plaintext — safe to retry)
@@ -440,7 +442,7 @@ impl CouchDBPeer {
                         "mtime": doc_mtime,
                         "size": doc_size,
                         "children": doc_children,
-                        "eden": {},
+                        "eden": existing_eden,
                     });
                     if let Some(rev) = existing_rev {
                         doc["_rev"] = serde_json::json!(rev);
