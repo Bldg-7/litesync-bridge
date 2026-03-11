@@ -3,6 +3,7 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
+use parking_lot::Mutex;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
@@ -11,13 +12,14 @@ use litesync_commonlib::path as lspath;
 
 use crate::bridge::{ChangeEvent, PeerMessage};
 use crate::config::StoragePeerConfig;
-use crate::state::WriteTracker;
+use crate::state::{StatCache, WriteTracker};
 
 pub struct StoragePeer {
     name: Arc<str>,
     group: Arc<str>,
     base_dir: std::path::PathBuf,
     write_tracker: WriteTracker,
+    stat_cache: Mutex<Option<StatCache>>,
 }
 
 impl StoragePeer {
@@ -27,7 +29,21 @@ impl StoragePeer {
             group: Arc::from(config.group),
             base_dir: config.base_dir,
             write_tracker: WriteTracker::new(),
+            stat_cache: Mutex::new(None),
         }
+    }
+
+    pub(crate) fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub(crate) fn group(&self) -> &str {
+        &self.group
+    }
+
+    /// Set the stat cache (injected after reconciliation).
+    pub(crate) fn set_stat_cache(&self, cache: StatCache) {
+        *self.stat_cache.lock() = Some(cache);
     }
 
     /// Spawn watcher (outbound) and inbound (write) tasks.
@@ -132,6 +148,21 @@ impl StoragePeer {
                         }
                         match self.read_file(event_path, rel).await {
                             Ok(Some(change_event)) => {
+                                // Update stat cache
+                                if let ChangeEvent::Modified {
+                                    ref path,
+                                    mtime,
+                                    ref data,
+                                    ..
+                                } = change_event
+                                {
+                                    self.update_stat_cache(
+                                        &path.to_string_lossy(),
+                                        mtime,
+                                        data.len() as u64,
+                                    );
+                                }
+
                                 let msg = PeerMessage {
                                     source_name: self.name.clone(),
                                     group: self.group.clone(),
@@ -157,6 +188,10 @@ impl StoragePeer {
                         if rel.extension().is_none() {
                             continue;
                         }
+
+                        // Update stat cache
+                        self.remove_stat_cache(&rel_str);
+
                         let msg = PeerMessage {
                             source_name: self.name.clone(),
                             group: self.group.clone(),
@@ -172,6 +207,9 @@ impl StoragePeer {
                 }
             }
         }
+
+        // Save stat cache on shutdown
+        self.save_stat_cache().await;
 
         tracing::info!(peer = %self.name, "watcher loop stopped");
         Ok(())
@@ -271,6 +309,10 @@ impl StoragePeer {
                     .await??;
                 self.write_tracker.record(full);
 
+                // Update stat cache after inbound write
+                let rel_str = path.to_string_lossy();
+                self.update_stat_cache(&rel_str, mtime, data.len() as u64);
+
                 tracing::debug!(peer = %self.name, path = %path.display(), "wrote file");
             }
             ChangeEvent::Deleted { path } => {
@@ -278,6 +320,10 @@ impl StoragePeer {
 
                 // Record before deleting so the watcher can skip the echo
                 self.write_tracker.record(full.clone());
+
+                // Update stat cache
+                let rel_str = path.to_string_lossy();
+                self.remove_stat_cache(&rel_str);
 
                 match tokio::fs::remove_file(&full).await {
                     Ok(()) => {
@@ -290,5 +336,30 @@ impl StoragePeer {
         }
 
         Ok(())
+    }
+
+    // =========================================================================
+    // StatCache helpers
+    // =========================================================================
+
+    fn update_stat_cache(&self, rel_path: &str, mtime: u64, size: u64) {
+        if let Some(ref mut cache) = *self.stat_cache.lock() {
+            cache.insert(rel_path.to_string(), mtime, size);
+        }
+    }
+
+    fn remove_stat_cache(&self, rel_path: &str) {
+        if let Some(ref mut cache) = *self.stat_cache.lock() {
+            cache.remove(rel_path);
+        }
+    }
+
+    async fn save_stat_cache(&self) {
+        let cache = self.stat_cache.lock().take();
+        if let Some(cache) = cache {
+            if let Err(e) = cache.save().await {
+                tracing::warn!(peer = %self.name, "failed to save stat cache: {e}");
+            }
+        }
     }
 }

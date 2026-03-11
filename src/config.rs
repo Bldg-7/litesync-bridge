@@ -64,7 +64,7 @@ impl std::fmt::Debug for CouchDBPeerConfig {
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct StoragePeerConfig {
     pub name: String,

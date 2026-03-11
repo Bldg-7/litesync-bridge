@@ -9,6 +9,7 @@ use crate::bridge::{ChangeEvent, PeerMessage};
 use crate::config::{Config, PeerConfig};
 use crate::peer::couchdb::CouchDBPeer;
 use crate::peer::storage::StoragePeer;
+use crate::reconcile::{self, InitializedPeer};
 
 /// Central dispatcher that routes change events between peers in the same group.
 pub struct Hub {
@@ -25,27 +26,54 @@ impl Hub {
         data_dir: PathBuf,
         cancel: CancellationToken,
     ) -> anyhow::Result<()> {
+        // ── Phase 1: Initialize all peers ────────────────────────────────
+        let mut initialized: Vec<InitializedPeer> = Vec::new();
+
+        for peer_config in self.config.peers {
+            match peer_config {
+                PeerConfig::CouchDB(config) => {
+                    let (peer, since) = CouchDBPeer::init(config, &data_dir).await?;
+                    initialized.push(InitializedPeer::CouchDB { peer, since });
+                }
+                PeerConfig::Storage(config) => {
+                    let peer = StoragePeer::new(config.clone());
+                    initialized.push(InitializedPeer::Storage {
+                        peer,
+                        config,
+                    });
+                }
+            }
+        }
+
+        tracing::info!(peers = initialized.len(), "all peers initialized");
+
+        // ── Phase 2: Reconcile offline changes ───────────────────────────
+        reconcile::reconcile_all(&mut initialized[..], &data_dir, &cancel).await?;
+
+        if cancel.is_cancelled() {
+            return Ok(());
+        }
+
+        // ── Phase 3: Spawn real-time loops ───────────────────────────────
         let (hub_tx, mut hub_rx) = mpsc::channel::<PeerMessage>(256);
 
         let mut peer_txs: HashMap<String, mpsc::Sender<ChangeEvent>> = HashMap::new();
         let mut peer_groups: HashMap<String, String> = HashMap::new();
         let mut handles: Vec<JoinHandle<()>> = Vec::new();
 
-        for peer_config in self.config.peers {
-            let name = peer_config.name().to_string();
-            let group = peer_config.group().to_string();
+        for init_peer in initialized {
+            let name = init_peer.name().to_string();
+            let group = init_peer.group().to_string();
             let (tx, rx) = mpsc::channel::<ChangeEvent>(256);
 
             peer_txs.insert(name.clone(), tx);
-            peer_groups.insert(name.clone(), group);
+            peer_groups.insert(name, group);
 
-            match peer_config {
-                PeerConfig::CouchDB(config) => {
-                    let (peer, since) = CouchDBPeer::init(config, &data_dir).await?;
+            match init_peer {
+                InitializedPeer::CouchDB { peer, since } => {
                     handles.extend(peer.spawn(since, hub_tx.clone(), rx, cancel.clone()));
                 }
-                PeerConfig::Storage(config) => {
-                    let peer = StoragePeer::new(config);
+                InitializedPeer::Storage { peer, .. } => {
                     handles.extend(peer.spawn(hub_tx.clone(), rx, cancel.clone()));
                 }
             }
@@ -56,7 +84,7 @@ impl Hub {
 
         tracing::info!(peers = peer_txs.len(), "hub routing started");
 
-        // Routing loop
+        // ── Phase 4: Routing loop ────────────────────────────────────────
         loop {
             let msg = tokio::select! {
                 _ = cancel.cancelled() => break,

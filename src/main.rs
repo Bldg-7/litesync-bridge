@@ -2,6 +2,7 @@ mod bridge;
 mod config;
 mod hub;
 mod peer;
+mod reconcile;
 mod state;
 
 use std::path::Path;

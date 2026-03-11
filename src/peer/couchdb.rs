@@ -96,6 +96,32 @@ impl CouchDBPeer {
         Ok((peer, since))
     }
 
+    // ── Accessors for reconciliation ────────────────────────────────────────
+
+    pub(crate) fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub(crate) fn group(&self) -> &str {
+        &self.group
+    }
+
+    pub(crate) fn client(&self) -> &CouchDBClient {
+        &self.client
+    }
+
+    pub(crate) fn e2ee(&self) -> Option<&E2EEContext> {
+        self.e2ee.as_ref()
+    }
+
+    pub(crate) fn base_dir_prefix(&self) -> &str {
+        &self.base_dir
+    }
+
+    pub(crate) fn obfuscate_passphrase(&self) -> Option<&str> {
+        self.obfuscate_passphrase.as_deref()
+    }
+
     /// Spawn outbound (changes feed) and inbound (write) tasks.
     pub fn spawn(
         self,

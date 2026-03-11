@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::io::BufRead;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -182,5 +183,159 @@ impl RevTracker {
     /// Returns `true` if it was our write (caller should skip the change).
     pub fn check_and_remove(&self, rev: &str) -> bool {
         self.revs.lock().remove(rev).is_some()
+    }
+}
+
+/// Persistent filesystem stat snapshot for detecting offline changes.
+///
+/// Stores `rel_path → "mtime_ms-size"` mappings in a TSV file at
+/// `{data_dir}/{peer_name}.stats`. Used by reconciliation to distinguish
+/// "file was deleted while offline" from "file never existed locally".
+pub struct StatCache {
+    path: PathBuf,
+    entries: HashMap<String, String>,
+}
+
+impl StatCache {
+    /// Load stat cache from disk. Returns an empty cache if the file doesn't exist.
+    pub fn load(data_dir: &Path, peer_name: &str) -> Self {
+        let path = data_dir.join(format!("{peer_name}.stats"));
+        let entries = Self::read_file(&path).unwrap_or_default();
+        Self { path, entries }
+    }
+
+    fn read_file(path: &Path) -> Option<HashMap<String, String>> {
+        let file = std::fs::File::open(path).ok()?;
+        let reader = std::io::BufReader::new(file);
+        let mut map = HashMap::new();
+        for line in reader.lines() {
+            let line = line.ok()?;
+            if let Some((rel_path, stat_val)) = line.split_once('\t') {
+                if !rel_path.is_empty() && !stat_val.is_empty() {
+                    map.insert(rel_path.to_string(), stat_val.to_string());
+                }
+            }
+        }
+        Some(map)
+    }
+
+    /// Check if a file was previously tracked (existed in the last snapshot).
+    pub fn existed(&self, rel_path: &str) -> bool {
+        self.entries.contains_key(rel_path)
+    }
+
+    /// Get the stored stat value for a path.
+    pub fn get(&self, rel_path: &str) -> Option<&str> {
+        self.entries.get(rel_path).map(String::as_str)
+    }
+
+    /// Check if a file's stat has changed compared to the cached value.
+    /// Returns `true` if the file is new or its mtime/size differ.
+    pub fn is_changed(&self, rel_path: &str, mtime_ms: u64, size: u64) -> bool {
+        match self.entries.get(rel_path) {
+            Some(cached) => cached != &Self::stat_value(mtime_ms, size),
+            None => true,
+        }
+    }
+
+    /// Insert or update a stat entry.
+    pub fn insert(&mut self, rel_path: String, mtime_ms: u64, size: u64) {
+        self.entries
+            .insert(rel_path, Self::stat_value(mtime_ms, size));
+    }
+
+    /// Remove a stat entry.
+    pub fn remove(&mut self, rel_path: &str) {
+        self.entries.remove(rel_path);
+    }
+
+    /// Check if the cache is empty (first run or reset).
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// Persist the cache to disk.
+    pub async fn save(&self) -> anyhow::Result<()> {
+        if let Some(parent) = self.path.parent() {
+            tokio::fs::create_dir_all(parent).await?;
+        }
+        let mut content = String::with_capacity(self.entries.len() * 80);
+        // Sort for deterministic output
+        let mut keys: Vec<&str> = self.entries.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        for key in keys {
+            if let Some(val) = self.entries.get(key) {
+                content.push_str(key);
+                content.push('\t');
+                content.push_str(val);
+                content.push('\n');
+            }
+        }
+        tokio::fs::write(&self.path, content).await?;
+        Ok(())
+    }
+
+    fn stat_value(mtime_ms: u64, size: u64) -> String {
+        format!("{mtime_ms}-{size}")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn stat_cache_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let data_dir = dir.path();
+
+        // Create and populate
+        let mut cache = StatCache::load(data_dir, "test");
+        assert!(cache.is_empty());
+        cache.insert("notes/hello.md".to_string(), 1700000000000, 1234);
+        cache.insert("attachments/img.png".to_string(), 1700000001000, 5678);
+        cache.save().await.unwrap();
+
+        // Reload and verify
+        let cache2 = StatCache::load(data_dir, "test");
+        assert!(!cache2.is_empty());
+        assert_eq!(cache2.get("notes/hello.md"), Some("1700000000000-1234"));
+        assert_eq!(
+            cache2.get("attachments/img.png"),
+            Some("1700000001000-5678")
+        );
+        assert!(cache2.get("nonexistent.md").is_none());
+    }
+
+    #[test]
+    fn stat_cache_is_changed() {
+        let mut cache = StatCache {
+            path: PathBuf::from("/tmp/test.stats"),
+            entries: HashMap::new(),
+        };
+        cache.insert("a.md".to_string(), 1000, 100);
+
+        // Same values → not changed
+        assert!(!cache.is_changed("a.md", 1000, 100));
+        // Different mtime → changed
+        assert!(cache.is_changed("a.md", 2000, 100));
+        // Different size → changed
+        assert!(cache.is_changed("a.md", 1000, 200));
+        // Unknown file → changed
+        assert!(cache.is_changed("b.md", 1000, 100));
+    }
+
+    #[test]
+    fn stat_cache_existed_and_remove() {
+        let mut cache = StatCache {
+            path: PathBuf::from("/tmp/test.stats"),
+            entries: HashMap::new(),
+        };
+        cache.insert("a.md".to_string(), 1000, 100);
+        assert!(cache.existed("a.md"));
+        assert!(!cache.existed("b.md"));
+
+        cache.remove("a.md");
+        assert!(!cache.existed("a.md"));
     }
 }
