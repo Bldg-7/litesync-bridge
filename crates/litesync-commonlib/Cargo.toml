@@ -10,6 +10,7 @@ description = "Rust implementation of Self-hosted LiveSync protocol (E2EE, chunk
 # HTTP / CouchDB
 reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
 tokio = { version = "1", features = ["full"] }
+urlencoding = "2"
 
 # Serialization
 serde = { version = "1", features = ["derive"] }
@@ -19,6 +20,8 @@ serde_json = "1"
 aes-gcm = "0.10"
 hkdf = "0.12"
 sha2 = "0.10"
+pbkdf2 = "0.12"
+hmac = "0.12"
 
 # Hashing
 xxhash-rust = { version = "0.8", features = ["xxh32", "xxh64"] }
