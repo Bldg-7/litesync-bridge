@@ -209,7 +209,8 @@ impl StatCache {
         let reader = std::io::BufReader::new(file);
         let mut map = HashMap::new();
         for line in reader.lines() {
-            let line = line.ok()?;
+            // Skip unreadable lines instead of aborting the whole cache
+            let Ok(line) = line else { continue };
             if let Some((rel_path, stat_val)) = line.split_once('\t') {
                 if !rel_path.is_empty() && !stat_val.is_empty() {
                     map.insert(rel_path.to_string(), stat_val.to_string());

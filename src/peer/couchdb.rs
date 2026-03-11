@@ -17,22 +17,22 @@ use crate::config::CouchDBPeerConfig;
 use crate::state::{PathCache, RevTracker, SinceTracker};
 
 const LONGPOLL_TIMEOUT_MS: u64 = 30_000;
-const DEFAULT_PIECE_SIZE: usize = 250_000;
-const MAX_CONFLICT_RETRIES: u32 = 3;
+pub(crate) const DEFAULT_PIECE_SIZE: usize = 250_000;
+pub(crate) const MAX_CONFLICT_RETRIES: u32 = 3;
 
-fn is_conflict(err: &anyhow::Error) -> bool {
+pub(crate) fn is_conflict(err: &anyhow::Error) -> bool {
     err.downcast_ref::<CouchDBHttpError>()
         .is_some_and(|e| e.status == 409)
 }
 
-fn is_not_found(err: &anyhow::Error) -> bool {
+pub(crate) fn is_not_found(err: &anyhow::Error) -> bool {
     err.downcast_ref::<CouchDBHttpError>()
         .is_some_and(|e| e.status == 404)
 }
 
 /// Check if a relative path refers to a hidden file/directory.
 /// Matches the same convention as StoragePeer's watcher filter.
-fn is_hidden_path(rel_path: &str) -> bool {
+pub(crate) fn is_hidden_path(rel_path: &str) -> bool {
     rel_path.starts_with('.') || rel_path.contains("/.")
 }
 
@@ -120,6 +120,14 @@ impl CouchDBPeer {
 
     pub(crate) fn obfuscate_passphrase(&self) -> Option<&str> {
         self.obfuscate_passphrase.as_deref()
+    }
+
+    pub(crate) fn rev_tracker(&self) -> &Arc<RevTracker> {
+        &self.rev_tracker
+    }
+
+    pub(crate) fn path_cache(&self) -> &Arc<PathCache> {
+        &self.path_cache
     }
 
     /// Spawn outbound (changes feed) and inbound (write) tasks.

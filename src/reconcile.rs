@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use tokio_util::sync::CancellationToken;
@@ -9,9 +10,12 @@ use litesync_commonlib::couchdb::CouchDBClient;
 use litesync_commonlib::doc::{RawNoteEntry, TYPE_NEWNOTE, TYPE_PLAIN};
 use litesync_commonlib::path;
 
-use crate::peer::couchdb::CouchDBPeer;
+use crate::peer::couchdb::{
+    is_conflict, is_hidden_path, is_not_found, CouchDBPeer, DEFAULT_PIECE_SIZE,
+    MAX_CONFLICT_RETRIES,
+};
 use crate::peer::storage::StoragePeer;
-use crate::state::{SinceTracker, StatCache};
+use crate::state::{PathCache, RevTracker, SinceTracker, StatCache};
 
 /// Mtime tolerance: differences within 1 second are considered equal.
 const MTIME_TOLERANCE_MS: u64 = 1000;
@@ -60,6 +64,10 @@ pub struct ReconcileStats {
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Compute reconciliation actions by comparing remote and local state.
+///
+/// Uses Last-Writer-Wins (mtime-based, 1s tolerance) for files that exist on
+/// both sides. For one-sided entries, the since tracker state and stat cache
+/// are used as discriminators.
 ///
 /// `is_first_run` indicates the since tracker had no saved sequence ("now"),
 /// meaning we've never synced before. In this case, missing local files are
@@ -158,25 +166,19 @@ pub fn compute_actions(
     }
 
     // Sort for deterministic order
-    actions.sort_by(|a, b| {
-        let path_a = match a {
-            ReconcileAction::DownloadToLocal { rel_path, .. }
-            | ReconcileAction::UploadToRemote { rel_path }
-            | ReconcileAction::DeleteLocal { rel_path }
-            | ReconcileAction::DeleteRemote { rel_path, .. }
-            | ReconcileAction::InSync { rel_path } => rel_path,
-        };
-        let path_b = match b {
-            ReconcileAction::DownloadToLocal { rel_path, .. }
-            | ReconcileAction::UploadToRemote { rel_path }
-            | ReconcileAction::DeleteLocal { rel_path }
-            | ReconcileAction::DeleteRemote { rel_path, .. }
-            | ReconcileAction::InSync { rel_path } => rel_path,
-        };
-        path_a.cmp(path_b)
-    });
+    actions.sort_by(|a, b| action_path(a).cmp(action_path(b)));
 
     actions
+}
+
+fn action_path(action: &ReconcileAction) -> &str {
+    match action {
+        ReconcileAction::DownloadToLocal { rel_path, .. }
+        | ReconcileAction::UploadToRemote { rel_path }
+        | ReconcileAction::DeleteLocal { rel_path }
+        | ReconcileAction::DeleteRemote { rel_path, .. }
+        | ReconcileAction::InSync { rel_path } => rel_path,
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -216,13 +218,11 @@ fn scan_dir_recursive(
         let file_type = entry.file_type()?;
         let path = entry.path();
 
-        let rel = path
-            .strip_prefix(base_dir)
-            .unwrap_or(&path);
+        let rel = path.strip_prefix(base_dir).unwrap_or(&path);
         let rel_str = rel.to_string_lossy();
 
         // Skip hidden files/dirs
-        if rel_str.starts_with('.') || rel_str.contains("/.") {
+        if is_hidden_path(&rel_str) {
             continue;
         }
 
@@ -265,7 +265,6 @@ pub async fn fetch_remote_entries(
     client: &CouchDBClient,
     e2ee: Option<&E2EEContext>,
     base_dir_prefix: &str,
-    _obfuscate_passphrase: Option<&str>,
 ) -> anyhow::Result<(HashMap<String, RemoteEntry>, serde_json::Value)> {
     let changes = client.get_all_notes().await?;
     let mut map = HashMap::new();
@@ -273,23 +272,21 @@ pub async fn fetch_remote_entries(
     for change in &changes.results {
         let deleted = change.deleted == Some(true);
 
-        // For deleted docs, try to resolve path from doc_id
         if deleted {
-            if let Ok(full_path) = path::id2path(&change.id, None) {
-                if let Some(rel_path) = apply_base_dir_filter_static(base_dir_prefix, &full_path) {
-                    if !path::should_be_ignored(&rel_path) && !is_hidden_path(&rel_path) {
-                        map.insert(
-                            rel_path.clone(),
-                            RemoteEntry {
-                                rel_path,
-                                doc_id: change.id.clone(),
-                                mtime: 0,
-                                size: 0,
-                                deleted: true,
-                            },
-                        );
-                    }
-                }
+            // For deleted docs, try multiple strategies (matching CouchDBPeer)
+            if let Some(rel_path) =
+                resolve_deleted_path_static(&change.id, change.doc.as_ref(), e2ee, base_dir_prefix)
+            {
+                map.insert(
+                    rel_path.clone(),
+                    RemoteEntry {
+                        rel_path,
+                        doc_id: change.id.clone(),
+                        mtime: 0,
+                        size: 0,
+                        deleted: true,
+                    },
+                );
             }
             continue;
         }
@@ -314,7 +311,7 @@ pub async fn fetch_remote_entries(
             }
         };
 
-        let rel_path = match apply_base_dir_filter_static(base_dir_prefix, &note.path) {
+        let rel_path = match apply_base_dir_filter(base_dir_prefix, &note.path) {
             Some(r) => r,
             None => continue,
         };
@@ -338,17 +335,47 @@ pub async fn fetch_remote_entries(
     Ok((map, changes.last_seq))
 }
 
-fn apply_base_dir_filter_static(base_dir_prefix: &str, full_path: &str) -> Option<String> {
+/// Resolve the relative path for a deleted document using multiple strategies.
+/// Mirrors `CouchDBPeer::resolve_deleted_path` but without path cache (unavailable
+/// during reconciliation's initial fetch).
+fn resolve_deleted_path_static(
+    doc_id: &str,
+    doc_value: Option<&serde_json::Value>,
+    e2ee: Option<&E2EEContext>,
+    base_dir_prefix: &str,
+) -> Option<String> {
+    // Strategy 1: Try parsing the tombstone body (works for E2EE/obfuscated)
+    if let Some(val) = doc_value {
+        if let Ok(raw) = serde_json::from_value::<RawNoteEntry>(val.clone()) {
+            if let Ok(note) = chunk::resolve_note(&raw, e2ee, Some(true)) {
+                if let Some(rel) = apply_base_dir_filter(base_dir_prefix, &note.path) {
+                    if !path::should_be_ignored(&rel) && !is_hidden_path(&rel) {
+                        return Some(rel);
+                    }
+                }
+            }
+        }
+    }
+
+    // Strategy 2: Try reversing the doc ID (works for non-obfuscated IDs)
+    if let Ok(full_path) = path::id2path(doc_id, None) {
+        if let Some(rel) = apply_base_dir_filter(base_dir_prefix, &full_path) {
+            if !path::should_be_ignored(&rel) && !is_hidden_path(&rel) {
+                return Some(rel);
+            }
+        }
+    }
+
+    None
+}
+
+fn apply_base_dir_filter(base_dir_prefix: &str, full_path: &str) -> Option<String> {
     if base_dir_prefix.is_empty() {
         return Some(full_path.to_string());
     }
     full_path
         .strip_prefix(base_dir_prefix)
         .map(|s| s.to_string())
-}
-
-fn is_hidden_path(rel_path: &str) -> bool {
-    rel_path.starts_with('.') || rel_path.contains("/.")
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -365,6 +392,8 @@ async fn reconcile(
     storage_base_dir: &Path,
     since: &mut SinceTracker,
     stat_cache: &mut StatCache,
+    rev_tracker: &Arc<RevTracker>,
+    path_cache: &Arc<PathCache>,
     cancel: &CancellationToken,
 ) -> anyhow::Result<ReconcileStats> {
     let is_first_run = since.get() == "now";
@@ -377,7 +406,7 @@ async fn reconcile(
 
     // 1. Fetch remote state
     let (remote_map, last_seq) =
-        fetch_remote_entries(client, e2ee, base_dir_prefix, obfuscate_passphrase).await?;
+        fetch_remote_entries(client, e2ee, base_dir_prefix).await?;
     tracing::info!(remote_count = remote_map.len(), "fetched remote entries");
 
     if cancel.is_cancelled() {
@@ -414,13 +443,11 @@ async fn reconcile(
 
         match action {
             ReconcileAction::DownloadToLocal { rel_path, doc_id } => {
-                match execute_download(
-                    client, e2ee, doc_id, rel_path, storage_base_dir,
-                )
-                .await
-                {
+                match execute_download(client, e2ee, doc_id, rel_path, storage_base_dir).await {
                     Ok((mtime, size)) => {
                         stat_cache.insert(rel_path.clone(), mtime, size);
+                        // Cache doc_id → rel_path for future delete resolution
+                        path_cache.insert(doc_id.clone(), rel_path.clone());
                         stats.downloaded += 1;
                         tracing::debug!(path = %rel_path, "downloaded");
                     }
@@ -438,6 +465,8 @@ async fn reconcile(
                     obfuscate_passphrase,
                     rel_path,
                     storage_base_dir,
+                    rev_tracker,
+                    path_cache,
                 )
                 .await
                 {
@@ -471,7 +500,7 @@ async fn reconcile(
                 }
             }
             ReconcileAction::DeleteRemote { rel_path, doc_id } => {
-                match execute_delete_remote(client, doc_id).await {
+                match execute_delete_remote(client, doc_id, rev_tracker).await {
                     Ok(()) => {
                         stat_cache.remove(rel_path);
                         stats.deleted_remote += 1;
@@ -493,11 +522,28 @@ async fn reconcile(
         }
     }
 
-    // 5. Persist stat cache
-    stat_cache.save().await?;
+    // 5. On cancellation, don't persist anything — keep prior state intact
+    if cancel.is_cancelled() {
+        tracing::info!("reconciliation cancelled, not persisting state");
+        return Ok(stats);
+    }
 
-    // 6. Update since tracker so longpoll starts after this point
-    since.update(&last_seq).await?;
+    // 6. Don't advance since if there were errors — next run will re-reconcile
+    if stats.errors > 0 {
+        tracing::warn!(
+            errors = stats.errors,
+            "reconciliation had errors, not advancing since sequence"
+        );
+        // Still save stat cache so successful actions aren't repeated
+        stat_cache.save().await?;
+    } else {
+        // Persist stat cache
+        stat_cache.save().await?;
+
+        // Update since tracker so longpoll starts after this point
+        since.update(&last_seq).await?;
+    }
+
     tracing::info!(
         since = %since.get(),
         downloaded = stats.downloaded,
@@ -511,8 +557,6 @@ async fn reconcile(
 
     Ok(stats)
 }
-
-const DEFAULT_PIECE_SIZE: usize = 250_000;
 
 async fn execute_download(
     client: &CouchDBClient,
@@ -544,6 +588,7 @@ async fn execute_download(
     Ok((note.mtime, data.len() as u64))
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn execute_upload(
     client: &CouchDBClient,
     e2ee: Option<&E2EEContext>,
@@ -551,6 +596,8 @@ async fn execute_upload(
     obfuscate_passphrase: Option<&str>,
     rel_path: &str,
     storage_base_dir: &Path,
+    rev_tracker: &Arc<RevTracker>,
+    path_cache: &Arc<PathCache>,
 ) -> anyhow::Result<(u64, u64)> {
     let full = storage_base_dir.join(rel_path);
     let metadata = tokio::fs::metadata(&full).await?;
@@ -579,70 +626,115 @@ async fn execute_upload(
     let doc_id = path::path2id(&full_path, obfuscate_passphrase);
     let result = chunk::disassemble(&data, rel_path, DEFAULT_PIECE_SIZE, e2ee)?;
 
+    // Write chunks (content-addressed, idempotent — outside retry loop)
     client.put_chunks(&result.chunks).await?;
 
     let doc_type = if is_binary { TYPE_NEWNOTE } else { TYPE_PLAIN };
 
-    // Fetch existing rev
-    let existing_rev: Option<String> = client
-        .get_doc::<serde_json::Value>(&doc_id)
-        .await
-        .ok()
-        .and_then(|d| d.get("_rev").and_then(|v| v.as_str()).map(String::from));
+    // Retry loop matching CouchDBPeer::handle_write
+    for attempt in 0..MAX_CONFLICT_RETRIES {
+        // Fetch existing doc for _rev and eden preservation
+        let (existing_rev, existing_eden) = client
+            .get_doc::<serde_json::Value>(&doc_id)
+            .await
+            .ok()
+            .map(|d| {
+                let rev = d
+                    .get("_rev")
+                    .and_then(|v| v.as_str())
+                    .map(String::from);
+                let eden = d.get("eden").cloned().unwrap_or(serde_json::json!({}));
+                (rev, eden)
+            })
+            .unwrap_or((None, serde_json::json!({})));
 
-    let (path_field, doc_ctime, doc_mtime, doc_size, doc_children) =
-        if let Some(ctx) = e2ee {
-            let encrypted = litesync_commonlib::crypto::encrypt_meta(
-                &full_path,
-                mtime,
-                ctime,
-                size,
-                &result.children,
-                &ctx.master_key,
-            )?;
-            (encrypted, 0u64, 0u64, 0u64, Vec::<String>::new())
-        } else {
-            (full_path.clone(), ctime, mtime, size, result.children.clone())
-        };
+        let (path_field, doc_ctime, doc_mtime, doc_size, doc_children) =
+            if let Some(ctx) = e2ee {
+                let encrypted = litesync_commonlib::crypto::encrypt_meta(
+                    &full_path,
+                    mtime,
+                    ctime,
+                    size,
+                    &result.children,
+                    &ctx.master_key,
+                )?;
+                (encrypted, 0u64, 0u64, 0u64, Vec::<String>::new())
+            } else {
+                (
+                    full_path.clone(),
+                    ctime,
+                    mtime,
+                    size,
+                    result.children.clone(),
+                )
+            };
 
-    let mut doc = serde_json::json!({
-        "_id": doc_id,
-        "type": doc_type,
-        "path": path_field,
-        "ctime": doc_ctime,
-        "mtime": doc_mtime,
-        "size": doc_size,
-        "children": doc_children,
-        "eden": {},
-    });
-    if let Some(rev) = existing_rev {
-        doc["_rev"] = serde_json::json!(rev);
+        let mut doc = serde_json::json!({
+            "_id": doc_id,
+            "type": doc_type,
+            "path": path_field,
+            "ctime": doc_ctime,
+            "mtime": doc_mtime,
+            "size": doc_size,
+            "children": doc_children,
+            "eden": existing_eden,
+        });
+        if let Some(rev) = existing_rev {
+            doc["_rev"] = serde_json::json!(rev);
+        }
+
+        match client.put_doc(&doc_id, &doc).await {
+            Ok(resp) => {
+                rev_tracker.record(resp.rev);
+                path_cache.insert(doc_id.clone(), rel_path.to_string());
+                break;
+            }
+            Err(e) if attempt < MAX_CONFLICT_RETRIES - 1 && is_conflict(&e) => {
+                tracing::debug!(
+                    doc_id = %doc_id, attempt,
+                    "409 conflict on reconciliation put, retrying"
+                );
+                continue;
+            }
+            Err(e) => return Err(e),
+        }
     }
 
-    client.put_doc(&doc_id, &doc).await?;
     Ok((mtime, size))
 }
 
-async fn execute_delete_remote(client: &CouchDBClient, doc_id: &str) -> anyhow::Result<()> {
-    let doc: serde_json::Value = match client.get_doc(doc_id).await {
-        Ok(d) => d,
-        Err(e) => {
-            // If 404, already deleted
-            if e.downcast_ref::<litesync_commonlib::couchdb::CouchDBHttpError>()
-                .is_some_and(|e| e.status == 404)
-            {
+async fn execute_delete_remote(
+    client: &CouchDBClient,
+    doc_id: &str,
+    rev_tracker: &Arc<RevTracker>,
+) -> anyhow::Result<()> {
+    for attempt in 0..MAX_CONFLICT_RETRIES {
+        let doc: serde_json::Value = match client.get_doc(doc_id).await {
+            Ok(d) => d,
+            Err(e) if is_not_found(&e) => return Ok(()),
+            Err(e) => return Err(e),
+        };
+
+        let rev = doc
+            .get("_rev")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow::anyhow!("missing _rev on {doc_id}"))?;
+
+        match client.delete_doc(doc_id, rev).await {
+            Ok(resp) => {
+                rev_tracker.record(resp.rev);
                 return Ok(());
             }
-            return Err(e);
+            Err(e) if attempt < MAX_CONFLICT_RETRIES - 1 && is_conflict(&e) => {
+                tracing::debug!(
+                    doc_id = %doc_id, attempt,
+                    "409 conflict on reconciliation delete, retrying"
+                );
+                continue;
+            }
+            Err(e) => return Err(e),
         }
-    };
-
-    let rev = doc
-        .get("_rev")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| anyhow::anyhow!("missing _rev on {doc_id}"))?;
-
-    client.delete_doc(doc_id, rev).await?;
+    }
     Ok(())
 }
 
@@ -685,7 +777,6 @@ pub async fn reconcile_all(
     cancel: &CancellationToken,
 ) -> anyhow::Result<()> {
     // Collect (couch_idx, storage_idx, group) pairs to reconcile.
-    // We gather indices first, then process them one at a time.
     let mut pairs: Vec<(usize, usize, String)> = Vec::new();
 
     {
@@ -720,7 +811,7 @@ pub async fn reconcile_all(
             return Ok(());
         }
 
-        // Collect storage info from the storage peer (immutable borrow, then drop)
+        // Collect storage info (immutable borrow, then drop)
         let (storage_name, storage_base_dir) = match &peers[storage_idx] {
             InitializedPeer::Storage { config, .. } => {
                 (config.name.clone(), config.base_dir.clone())
@@ -744,6 +835,8 @@ pub async fn reconcile_all(
 
         let base_dir_prefix = peer.base_dir_prefix().to_string();
         let obfuscate_passphrase = peer.obfuscate_passphrase().map(String::from);
+        let rev_tracker = peer.rev_tracker().clone();
+        let path_cache = peer.path_cache().clone();
 
         let result = reconcile(
             peer.client(),
@@ -753,6 +846,8 @@ pub async fn reconcile_all(
             &storage_base_dir,
             since,
             &mut stat_cache,
+            &rev_tracker,
+            &path_cache,
             cancel,
         )
         .await;
@@ -819,6 +914,8 @@ mod tests {
         )
     }
 
+    // ── Mtime tolerance boundary tests ──────────────────────────────────
+
     #[test]
     fn both_exist_in_sync_within_tolerance() {
         let remote_map: HashMap<_, _> = [remote("a.md", 1000, 100)].into_iter().collect();
@@ -829,6 +926,36 @@ mod tests {
         assert_eq!(actions, vec![ReconcileAction::InSync {
             rel_path: "a.md".into()
         }]);
+    }
+
+    #[test]
+    fn both_exist_exact_tolerance_boundary_in_sync() {
+        // Exactly 1000ms diff → should be InSync (<=)
+        let remote_map: HashMap<_, _> = [remote("a.md", 2000, 100)].into_iter().collect();
+        let local_map: HashMap<_, _> = [local("a.md", 1000, 100)].into_iter().collect();
+        let cache = make_stat_cache();
+
+        let actions = compute_actions(&remote_map, &local_map, &cache, false);
+        assert_eq!(actions, vec![ReconcileAction::InSync {
+            rel_path: "a.md".into()
+        }]);
+    }
+
+    #[test]
+    fn both_exist_just_over_tolerance_download() {
+        // 1001ms diff → should trigger download (remote newer)
+        let remote_map: HashMap<_, _> = [remote("a.md", 2001, 100)].into_iter().collect();
+        let local_map: HashMap<_, _> = [local("a.md", 1000, 100)].into_iter().collect();
+        let cache = make_stat_cache();
+
+        let actions = compute_actions(&remote_map, &local_map, &cache, false);
+        assert_eq!(
+            actions,
+            vec![ReconcileAction::DownloadToLocal {
+                rel_path: "a.md".into(),
+                doc_id: "doc:a.md".into(),
+            }]
+        );
     }
 
     #[test]
@@ -861,6 +988,8 @@ mod tests {
             }]
         );
     }
+
+    // ── One-sided: remote only ──────────────────────────────────────────
 
     #[test]
     fn remote_only_first_run_download() {
@@ -911,6 +1040,8 @@ mod tests {
         );
     }
 
+    // ── One-sided: local only ───────────────────────────────────────────
+
     #[test]
     fn local_only_upload() {
         let remote_map: HashMap<_, _> = HashMap::new();
@@ -925,6 +1056,8 @@ mod tests {
             }]
         );
     }
+
+    // ── Remote deleted scenarios ────────────────────────────────────────
 
     #[test]
     fn remote_deleted_local_exists_unchanged_delete_local() {
@@ -986,6 +1119,18 @@ mod tests {
         );
     }
 
+    // ── Edge cases ──────────────────────────────────────────────────────
+
+    #[test]
+    fn empty_remote_and_local() {
+        let remote_map: HashMap<_, _> = HashMap::new();
+        let local_map: HashMap<_, _> = HashMap::new();
+        let cache = make_stat_cache();
+
+        let actions = compute_actions(&remote_map, &local_map, &cache, false);
+        assert!(actions.is_empty());
+    }
+
     #[test]
     fn multiple_files_mixed_actions() {
         let remote_map: HashMap<_, _> = [
@@ -1028,6 +1173,8 @@ mod tests {
         );
     }
 
+    // ── Scan tests ──────────────────────────────────────────────────────
+
     #[test]
     fn scan_local_files_empty_dir() {
         let dir = tempfile::tempdir().unwrap();
@@ -1053,19 +1200,28 @@ mod tests {
         assert!(!map.contains_key(".hidden"));
     }
 
+    // ── Helper function tests ───────────────────────────────────────────
+
     #[test]
-    fn base_dir_filter_static() {
+    fn base_dir_filter_test() {
         assert_eq!(
-            apply_base_dir_filter_static("", "notes/a.md"),
+            apply_base_dir_filter("", "notes/a.md"),
             Some("notes/a.md".to_string())
         );
         assert_eq!(
-            apply_base_dir_filter_static("notes/", "notes/a.md"),
+            apply_base_dir_filter("notes/", "notes/a.md"),
             Some("a.md".to_string())
         );
-        assert_eq!(
-            apply_base_dir_filter_static("notes/", "other/a.md"),
-            None
-        );
+        assert_eq!(apply_base_dir_filter("notes/", "other/a.md"), None);
+    }
+
+    #[test]
+    fn hidden_path_edge_cases() {
+        assert!(is_hidden_path(".hidden"));
+        assert!(is_hidden_path(".obsidian/config.json"));
+        assert!(is_hidden_path("a/.hidden/b.md"));
+        // Trailing dot is NOT hidden
+        assert!(!is_hidden_path("file.md"));
+        assert!(!is_hidden_path("a/b.md"));
     }
 }

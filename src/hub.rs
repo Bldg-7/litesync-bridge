@@ -10,6 +10,7 @@ use crate::config::{Config, PeerConfig};
 use crate::peer::couchdb::CouchDBPeer;
 use crate::peer::storage::StoragePeer;
 use crate::reconcile::{self, InitializedPeer};
+use crate::state::StatCache;
 
 /// Central dispatcher that routes change events between peers in the same group.
 pub struct Hub {
@@ -52,6 +53,14 @@ impl Hub {
 
         if cancel.is_cancelled() {
             return Ok(());
+        }
+
+        // ── Phase 2.5: Inject stat caches into StoragePeers ─────────────
+        for init_peer in &initialized {
+            if let InitializedPeer::Storage { peer, config } = init_peer {
+                let stat_cache = StatCache::load(&data_dir, &config.name);
+                peer.set_stat_cache(stat_cache);
+            }
         }
 
         // ── Phase 3: Spawn real-time loops ───────────────────────────────
