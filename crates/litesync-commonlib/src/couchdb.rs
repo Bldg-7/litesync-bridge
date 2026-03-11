@@ -7,6 +7,17 @@ use serde_json::json;
 
 use crate::doc::{AllDocsResponse, BulkDocResult, ChangesResponse, EntryLeaf, PutResponse, TYPE_LEAF};
 
+/// Typed HTTP error from CouchDB, enabling callers to match on status code
+/// instead of parsing error strings.
+#[derive(Debug, thiserror::Error)]
+#[error("{method} {id}: {status} — {body}")]
+pub struct CouchDBHttpError {
+    pub method: &'static str,
+    pub id: String,
+    pub status: u16,
+    pub body: String,
+}
+
 /// HTTP client for CouchDB operations.
 #[derive(Clone)]
 pub struct CouchDBClient {
@@ -55,7 +66,12 @@ impl CouchDBClient {
         if !resp.status().is_success() {
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
-            anyhow::bail!("GET {id}: {status} — {body}");
+            return Err(CouchDBHttpError {
+                method: "GET",
+                id: id.to_string(),
+                status: status.as_u16(),
+                body,
+            }.into());
         }
 
         Ok(resp.json().await?)
@@ -235,7 +251,12 @@ impl CouchDBClient {
         if !resp.status().is_success() {
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
-            anyhow::bail!("PUT {id}: {status} — {body}");
+            return Err(CouchDBHttpError {
+                method: "PUT",
+                id: id.to_string(),
+                status: status.as_u16(),
+                body,
+            }.into());
         }
 
         Ok(resp.json().await?)
@@ -295,7 +316,12 @@ impl CouchDBClient {
         if !resp.status().is_success() {
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
-            anyhow::bail!("DELETE {id}: {status} — {body}");
+            return Err(CouchDBHttpError {
+                method: "DELETE",
+                id: id.to_string(),
+                status: status.as_u16(),
+                body,
+            }.into());
         }
 
         Ok(resp.json().await?)

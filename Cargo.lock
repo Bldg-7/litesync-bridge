@@ -799,6 +799,7 @@ dependencies = [
  "filetime",
  "litesync-commonlib",
  "notify",
+ "parking_lot",
  "serde",
  "serde_json",
  "tokio",

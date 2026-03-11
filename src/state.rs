@@ -1,7 +1,8 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
 use std::time::{Duration, Instant};
+
+use parking_lot::Mutex;
 
 /// Tracks the CouchDB `since` sequence for a peer.
 ///
@@ -71,14 +72,14 @@ impl WriteTracker {
 
     /// Record that we just wrote to this path.
     pub fn record(&self, path: PathBuf) {
-        self.writes.lock().unwrap().insert(path, Instant::now());
+        self.writes.lock().insert(path, Instant::now());
     }
 
     /// Check if this path was recently written by us (within the suppress window).
     /// Returns `true` if it was our write (caller should skip the event).
     /// Stale entries are removed on access.
     pub fn is_own_write(&self, path: &Path) -> bool {
-        let mut map = self.writes.lock().unwrap();
+        let mut map = self.writes.lock();
         match map.get(path) {
             Some(t) if t.elapsed() < WRITE_SUPPRESS_WINDOW => true,
             Some(_) => {
@@ -93,10 +94,14 @@ impl WriteTracker {
 /// In-memory cache mapping CouchDB doc IDs to resolved relative paths.
 ///
 /// Used to resolve paths for deleted documents where the tombstone may not
-/// contain enough information (e.g., obfuscated IDs).
+/// contain enough information (e.g., obfuscated IDs). Capped at
+/// [`PATH_CACHE_MAX`] entries; oldest entries are evicted when full.
 pub struct PathCache {
     map: Mutex<HashMap<String, String>>,
 }
+
+/// Maximum number of entries in PathCache. 50K docs × ~200 bytes ≈ 10 MB.
+const PATH_CACHE_MAX: usize = 50_000;
 
 impl PathCache {
     pub fn new() -> Self {
@@ -105,37 +110,59 @@ impl PathCache {
         }
     }
 
-    /// Cache a doc_id → rel_path mapping.
+    /// Cache a doc_id → rel_path mapping. Evicts ~10% of entries when at capacity.
     pub fn insert(&self, doc_id: String, rel_path: String) {
-        self.map.lock().unwrap().insert(doc_id, rel_path);
+        let mut map = self.map.lock();
+        if map.len() >= PATH_CACHE_MAX && !map.contains_key(&doc_id) {
+            // Evict ~10% of entries. HashMap iteration order is arbitrary,
+            // which provides reasonable pseudo-random eviction.
+            let to_remove = PATH_CACHE_MAX / 10;
+            let keys: Vec<String> = map.keys().take(to_remove).cloned().collect();
+            for k in keys {
+                map.remove(&k);
+            }
+        }
+        map.insert(doc_id, rel_path);
     }
 
     /// Look up the cached relative path for a doc_id.
     pub fn get(&self, doc_id: &str) -> Option<String> {
-        self.map.lock().unwrap().get(doc_id).cloned()
+        self.map.lock().get(doc_id).cloned()
     }
 }
 
 /// Tracks recent CouchDB document revisions to prevent sync loops in CouchDBPeer.
+///
+/// Uses a time-window approach similar to [`WriteTracker`]: revisions older than
+/// [`REV_TTL`] are cleaned up on access, preventing unbounded growth.
 pub struct RevTracker {
-    revs: Mutex<HashSet<String>>,
+    revs: Mutex<HashMap<String, Instant>>,
 }
+
+/// Revisions older than this are considered stale and can be removed.
+/// 5 minutes covers worst-case changes feed lag.
+const REV_TTL: Duration = Duration::from_secs(300);
 
 impl RevTracker {
     pub fn new() -> Self {
         Self {
-            revs: Mutex::new(HashSet::new()),
+            revs: Mutex::new(HashMap::new()),
         }
     }
 
     /// Record a revision we just wrote.
     pub fn record(&self, rev: String) {
-        self.revs.lock().unwrap().insert(rev);
+        let mut map = self.revs.lock();
+        map.insert(rev, Instant::now());
+        // Periodic cleanup: every 1000 entries, sweep stale
+        if map.len() % 1000 == 0 {
+            map.retain(|_, t| t.elapsed() < REV_TTL);
+        }
     }
 
     /// Check if this rev was written by us, and remove it from tracking.
     /// Returns `true` if it was our write (caller should skip the change).
     pub fn check_and_remove(&self, rev: &str) -> bool {
-        self.revs.lock().unwrap().remove(rev)
+        self.revs.lock().remove(rev).is_some()
     }
 }

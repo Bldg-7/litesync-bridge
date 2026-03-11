@@ -7,7 +7,7 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use litesync_commonlib::chunk::{self, E2EEContext};
-use litesync_commonlib::couchdb::CouchDBClient;
+use litesync_commonlib::couchdb::{CouchDBClient, CouchDBHttpError};
 use litesync_commonlib::crypto;
 use litesync_commonlib::doc::{RawNoteEntry, TYPE_NEWNOTE, TYPE_PLAIN};
 use litesync_commonlib::path;
@@ -19,6 +19,16 @@ use crate::state::{PathCache, RevTracker, SinceTracker};
 const LONGPOLL_TIMEOUT_MS: u64 = 30_000;
 const DEFAULT_PIECE_SIZE: usize = 250_000;
 const MAX_CONFLICT_RETRIES: u32 = 3;
+
+fn is_conflict(err: &anyhow::Error) -> bool {
+    err.downcast_ref::<CouchDBHttpError>()
+        .is_some_and(|e| e.status == 409)
+}
+
+fn is_not_found(err: &anyhow::Error) -> bool {
+    err.downcast_ref::<CouchDBHttpError>()
+        .is_some_and(|e| e.status == 404)
+}
 
 pub struct CouchDBPeer {
     name: String,
@@ -451,7 +461,7 @@ impl CouchDBPeer {
                         }
                         Err(e)
                             if attempt < MAX_CONFLICT_RETRIES - 1
-                                && e.to_string().contains("409") =>
+                                && is_conflict(&e) =>
                         {
                             tracing::debug!(
                                 peer = %self.name, doc_id = %doc_id,
@@ -478,7 +488,7 @@ impl CouchDBPeer {
                     // Fetch current _rev (required for CouchDB delete)
                     let doc: serde_json::Value = match self.client.get_doc(&doc_id).await {
                         Ok(d) => d,
-                        Err(e) if e.to_string().contains("404") => {
+                        Err(e) if is_not_found(&e) => {
                             // Already deleted
                             tracing::debug!(
                                 peer = %self.name, path = %filename,
@@ -510,7 +520,7 @@ impl CouchDBPeer {
                         }
                         Err(e)
                             if attempt < MAX_CONFLICT_RETRIES - 1
-                                && e.to_string().contains("409") =>
+                                && is_conflict(&e) =>
                         {
                             tracing::debug!(
                                 peer = %self.name, doc_id = %doc_id,
