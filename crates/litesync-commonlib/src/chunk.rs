@@ -3,23 +3,54 @@ use base64::Engine;
 
 use crate::couchdb::CouchDBClient;
 use crate::crypto;
-use crate::doc::{NoteEntry, RawNoteEntry, ENCRYPTED_META_PREFIX};
+use crate::doc::{NoteEntry, RawNoteEntry, ENCRYPTED_META_PREFIX, EDEN_ENCRYPTED_KEY, EDEN_ENCRYPTED_KEY_HKDF};
 
 /// Encryption context for decrypting E2EE-protected data.
-pub struct E2EEContext<'a> {
-    pub passphrase: &'a str,
-    pub pbkdf2_salt: &'a [u8],
+///
+/// The master key is derived once from the passphrase and PBKDF2 salt,
+/// avoiding repeated PBKDF2 (310k iterations) per chunk.
+pub struct E2EEContext {
+    pub passphrase: String,
+    pub pbkdf2_salt: Vec<u8>,
+    pub master_key: [u8; 32],
+}
+
+impl E2EEContext {
+    pub fn new(passphrase: &str, pbkdf2_salt: &[u8]) -> Self {
+        let master_key = crypto::derive_master_key(passphrase, pbkdf2_salt);
+        Self {
+            passphrase: passphrase.to_string(),
+            pbkdf2_salt: pbkdf2_salt.to_vec(),
+            master_key,
+        }
+    }
 }
 
 /// Resolve a `RawNoteEntry` from CouchDB into a fully decoded `NoteEntry`.
 ///
 /// If E2EE is enabled (path starts with `/\:`), decrypts the metadata to
 /// extract the real path, timestamps, and children list.
-pub fn resolve_note(raw: &RawNoteEntry, e2ee: Option<&E2EEContext>) -> anyhow::Result<NoteEntry> {
+pub fn resolve_note(
+    raw: &RawNoteEntry,
+    e2ee: Option<&E2EEContext>,
+    change_deleted: Option<bool>,
+) -> anyhow::Result<NoteEntry> {
+    // Deletion can come from the changes feed (ChangeResult.deleted) or the
+    // document body (_deleted). Either source is authoritative.
+    let deleted = change_deleted.unwrap_or(false) || raw.is_deleted();
+
     if raw.path.starts_with(ENCRYPTED_META_PREFIX) {
         let ctx = e2ee
             .ok_or_else(|| anyhow::anyhow!("document is encrypted but no E2EE context provided"))?;
-        let meta = crypto::decrypt_meta(&raw.path, ctx.passphrase, ctx.pbkdf2_salt)?;
+        let meta = crypto::decrypt_meta(&raw.path, &ctx.master_key, &ctx.passphrase)?;
+
+        // Older plugin versions may not include children in the encrypted meta.
+        let children = if meta.children.is_empty() && !raw.children.is_empty() {
+            raw.children.clone()
+        } else {
+            meta.children
+        };
+
         Ok(NoteEntry {
             id: raw._id.clone(),
             rev: raw._rev.clone(),
@@ -27,9 +58,9 @@ pub fn resolve_note(raw: &RawNoteEntry, e2ee: Option<&E2EEContext>) -> anyhow::R
             ctime: meta.ctime,
             mtime: meta.mtime,
             size: meta.size,
-            children: meta.children,
+            children,
             eden: raw.eden.clone(),
-            deleted: raw.is_deleted(),
+            deleted,
             is_binary: raw.is_binary(),
         })
     } else {
@@ -42,7 +73,7 @@ pub fn resolve_note(raw: &RawNoteEntry, e2ee: Option<&E2EEContext>) -> anyhow::R
             size: raw.size,
             children: raw.children.clone(),
             eden: raw.eden.clone(),
-            deleted: raw.is_deleted(),
+            deleted,
             is_binary: raw.is_binary(),
         })
     }
@@ -59,7 +90,7 @@ pub fn resolve_note(raw: &RawNoteEntry, e2ee: Option<&E2EEContext>) -> anyhow::R
 pub async fn reassemble(
     client: &CouchDBClient,
     entry: &NoteEntry,
-    e2ee: Option<&E2EEContext<'_>>,
+    e2ee: Option<&E2EEContext>,
 ) -> anyhow::Result<Vec<u8>> {
     if entry.children.is_empty() {
         return Ok(vec![]);
@@ -71,7 +102,18 @@ pub async fn reassemble(
 
     for (i, child_id) in entry.children.iter().enumerate() {
         if let Some(eden_chunk) = entry.eden.get(child_id) {
+            // Direct match by chunk ID.
             chunk_data[i] = Some(eden_chunk.data.clone());
+        } else if e2ee.is_some() {
+            // When E2EE is enabled, encrypted eden chunks may be stored under
+            // sentinel keys instead of the regular chunk ID.
+            if let Some(eden_chunk) = entry.eden.get(EDEN_ENCRYPTED_KEY_HKDF)
+                .or_else(|| entry.eden.get(EDEN_ENCRYPTED_KEY))
+            {
+                chunk_data[i] = Some(eden_chunk.data.clone());
+            } else {
+                fetch_ids.push((i, child_id.clone()));
+            }
         } else {
             fetch_ids.push((i, child_id.clone()));
         }
@@ -102,10 +144,10 @@ pub async fn reassemble(
             anyhow::anyhow!("chunk {} not resolved for document {}", i, entry.id)
         })?;
 
-        // Decrypt if encrypted.
+        // Decrypt if encrypted, using the cached master key.
         let decoded_data = if let Some(ctx) = e2ee {
             if raw_data.starts_with("%=") || raw_data.starts_with("%$") {
-                crypto::decrypt_leaf_data(&raw_data, ctx.passphrase, ctx.pbkdf2_salt)?
+                crypto::decrypt_leaf_data(&raw_data, &ctx.master_key, &ctx.passphrase)?
             } else {
                 raw_data
             }

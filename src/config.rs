@@ -31,7 +31,7 @@ impl PeerConfig {
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CouchDBPeerConfig {
     pub name: String,
@@ -46,6 +46,22 @@ pub struct CouchDBPeerConfig {
     pub obfuscate_passphrase: Option<String>,
     #[serde(default)]
     pub base_dir: String,
+}
+
+impl std::fmt::Debug for CouchDBPeerConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CouchDBPeerConfig")
+            .field("name", &self.name)
+            .field("group", &self.group)
+            .field("database", &self.database)
+            .field("username", &self.username)
+            .field("password", &"[REDACTED]")
+            .field("url", &self.url)
+            .field("passphrase", &self.passphrase.as_ref().map(|_| "[REDACTED]"))
+            .field("obfuscate_passphrase", &self.obfuscate_passphrase.as_ref().map(|_| "[REDACTED]"))
+            .field("base_dir", &self.base_dir)
+            .finish()
+    }
 }
 
 #[derive(Debug, Deserialize)]

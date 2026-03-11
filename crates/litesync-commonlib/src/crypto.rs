@@ -25,7 +25,10 @@ const HKDF_SALTED_ENCRYPTED_PREFIX: &str = "%$";
 // --- Key Derivation ---
 
 /// Derive a 256-bit master key from a passphrase using PBKDF2-HMAC-SHA256.
-fn derive_master_key(passphrase: &str, pbkdf2_salt: &[u8]) -> [u8; 32] {
+///
+/// This is expensive (310k iterations). Callers should cache the result
+/// rather than calling per-chunk (see `E2EEContext::new`).
+pub fn derive_master_key(passphrase: &str, pbkdf2_salt: &[u8]) -> [u8; 32] {
     let mut master_key = [0u8; 32];
     pbkdf2::pbkdf2_hmac::<Sha256>(
         passphrase.as_bytes(),
@@ -57,11 +60,11 @@ fn decrypt_aes_gcm(key: &[u8; 32], iv: &[u8], ciphertext: &[u8]) -> anyhow::Resu
 
 // --- Public API ---
 
-/// Decrypt HKDF-encrypted string with known pbkdf2Salt (prefix `%=`).
+/// Decrypt HKDF-encrypted string with a pre-derived master key (prefix `%=`).
 ///
-/// Used for chunk data and metadata when the pbkdf2Salt is stored separately
-/// (e.g., in the sync parameters document).
-pub fn decrypt_hkdf(input: &str, passphrase: &str, pbkdf2_salt: &[u8]) -> anyhow::Result<String> {
+/// Used for chunk data and metadata when the pbkdf2Salt is stored separately.
+/// The `master_key` should be obtained from `derive_master_key()` once and cached.
+pub fn decrypt_hkdf(input: &str, master_key: &[u8; 32]) -> anyhow::Result<String> {
     let encoded = input
         .strip_prefix(HKDF_ENCRYPTED_PREFIX)
         .ok_or_else(|| anyhow::anyhow!("expected prefix '{HKDF_ENCRYPTED_PREFIX}'"))?;
@@ -75,8 +78,7 @@ pub fn decrypt_hkdf(input: &str, passphrase: &str, pbkdf2_salt: &[u8]) -> anyhow
     let hkdf_salt = &binary[IV_LENGTH..IV_LENGTH + HKDF_SALT_LENGTH];
     let ciphertext = &binary[IV_LENGTH + HKDF_SALT_LENGTH..];
 
-    let master_key = derive_master_key(passphrase, pbkdf2_salt);
-    let chunk_key = derive_chunk_key(&master_key, hkdf_salt)?;
+    let chunk_key = derive_chunk_key(master_key, hkdf_salt)?;
     let plaintext = decrypt_aes_gcm(&chunk_key, iv, ciphertext)?;
 
     String::from_utf8(plaintext).map_err(|e| anyhow::anyhow!("invalid UTF-8: {e}"))
@@ -85,6 +87,7 @@ pub fn decrypt_hkdf(input: &str, passphrase: &str, pbkdf2_salt: &[u8]) -> anyhow
 /// Decrypt HKDF-encrypted string with embedded pbkdf2Salt (prefix `%$`).
 ///
 /// Used for metadata encryption where the salt is stored alongside the ciphertext.
+/// Derives its own master key from the embedded salt (cannot use cached key).
 pub fn decrypt_with_ephemeral_salt(input: &str, passphrase: &str) -> anyhow::Result<String> {
     let encoded = input
         .strip_prefix(HKDF_SALTED_ENCRYPTED_PREFIX)
@@ -110,15 +113,18 @@ pub fn decrypt_with_ephemeral_salt(input: &str, passphrase: &str) -> anyhow::Res
 }
 
 /// Detect encryption format and decrypt accordingly.
+///
+/// For `%=` prefix: uses the pre-derived `master_key` (fast path).
+/// For `%$` prefix: derives a new master key from embedded salt (slow path).
 pub fn decrypt_string(
     input: &str,
+    master_key: &[u8; 32],
     passphrase: &str,
-    pbkdf2_salt: &[u8],
 ) -> anyhow::Result<String> {
     if input.starts_with(HKDF_SALTED_ENCRYPTED_PREFIX) {
         decrypt_with_ephemeral_salt(input, passphrase)
     } else if input.starts_with(HKDF_ENCRYPTED_PREFIX) {
-        decrypt_hkdf(input, passphrase, pbkdf2_salt)
+        decrypt_hkdf(input, master_key)
     } else {
         anyhow::bail!("unsupported encryption format")
     }
@@ -130,14 +136,14 @@ pub fn decrypt_string(
 /// encrypted JSON of `{path, mtime, ctime, size, children}`.
 pub fn decrypt_meta(
     path_field: &str,
+    master_key: &[u8; 32],
     passphrase: &str,
-    pbkdf2_salt: &[u8],
 ) -> anyhow::Result<DecryptedMeta> {
     let encrypted = path_field.strip_prefix(ENCRYPTED_META_PREFIX).ok_or_else(|| {
         anyhow::anyhow!("path is not encrypted (no '{ENCRYPTED_META_PREFIX}' prefix)")
     })?;
 
-    let json_str = decrypt_string(encrypted, passphrase, pbkdf2_salt)?;
+    let json_str = decrypt_string(encrypted, master_key, passphrase)?;
     let meta: DecryptedMeta = serde_json::from_str(&json_str)?;
     Ok(meta)
 }
@@ -145,8 +151,8 @@ pub fn decrypt_meta(
 /// Decrypt chunk data (EntryLeaf.data field).
 pub fn decrypt_leaf_data(
     data: &str,
+    master_key: &[u8; 32],
     passphrase: &str,
-    pbkdf2_salt: &[u8],
 ) -> anyhow::Result<String> {
-    decrypt_string(data, passphrase, pbkdf2_salt)
+    decrypt_string(data, master_key, passphrase)
 }

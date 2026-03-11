@@ -48,15 +48,18 @@ pub fn id2path(id: &str, entry_path: Option<&str>) -> anyhow::Result<String> {
         anyhow::bail!("cannot reverse obfuscated document ID without entry path");
     }
 
-    let (_prefix, body) = split_prefix(id);
+    let (prefix, body) = split_prefix(id);
     if body.starts_with(PREFIX_OBFUSCATED) {
         anyhow::bail!("cannot reverse obfuscated document ID without entry path");
     }
 
     // Remove leading "/" that was added for paths starting with "_".
-    let path = body.strip_prefix('/').unwrap_or(body);
+    if let Some(stripped) = body.strip_prefix('/') {
+        return Ok(stripped.to_string());
+    }
 
-    Ok(path.to_string())
+    // Preserve prefix for non-underscore paths (e.g., "ps:notes/hello.md").
+    Ok(format!("{prefix}{body}"))
 }
 
 /// Whether a file should be treated as plain text for chunk splitting.
@@ -101,14 +104,14 @@ fn split_prefix(path: &str) -> (&str, &str) {
     }
 }
 
-/// SHA-256 hash, iterated len(key) times (passphrase stretching).
+/// SHA-256 hash of passphrase for path obfuscation.
+///
+/// The original TypeScript `_hashString` has a bug where the stretching loop
+/// rehashes the original key (`buff`) instead of the previous digest, making
+/// the loop a no-op. The result is always `SHA-256(key)` regardless of length.
+/// We must replicate this behavior for compatibility with existing documents.
 fn hash_string_chain(key: &str) -> String {
-    let key_bytes = key.as_bytes();
-    let mut digest = sha256_bytes(key_bytes);
-    for _ in 0..key.len() {
-        digest = sha256_bytes(&digest);
-    }
-    hex::encode(digest)
+    sha256_hex(key)
 }
 
 fn sha256_hex(input: &str) -> String {
@@ -135,6 +138,11 @@ mod tests {
     fn test_id2path_simple() {
         assert_eq!(id2path("notes/hello.md", None).unwrap(), "notes/hello.md");
         assert_eq!(id2path("/_design/doc", None).unwrap(), "_design/doc");
+    }
+
+    #[test]
+    fn test_id2path_preserves_prefix() {
+        assert_eq!(id2path("ps:notes/hello.md", None).unwrap(), "ps:notes/hello.md");
     }
 
     #[test]

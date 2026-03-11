@@ -1,3 +1,4 @@
+use reqwest::header::{self, HeaderMap, HeaderValue};
 use reqwest::Client;
 use serde::de::DeserializeOwned;
 use serde_json::json;
@@ -13,27 +14,29 @@ pub struct CouchDBClient {
 }
 
 impl CouchDBClient {
-    pub fn new(base_url: &str, database: &str, username: &str, password: &str) -> Self {
+    pub fn new(base_url: &str, database: &str, username: &str, password: &str) -> anyhow::Result<Self> {
+        use base64::engine::general_purpose::STANDARD as BASE64;
+        use base64::Engine;
+
+        let credentials = BASE64.encode(format!("{username}:{password}"));
+        let mut auth_value = HeaderValue::from_str(&format!("Basic {credentials}"))?;
+        auth_value.set_sensitive(true);
+
+        let mut default_headers = HeaderMap::new();
+        default_headers.insert(header::AUTHORIZATION, auth_value);
+
         let client = Client::builder()
             .danger_accept_invalid_certs(false)
-            .build()
-            .expect("failed to build HTTP client");
+            .default_headers(default_headers)
+            .build()?;
 
-        // Encode credentials into the base URL for Basic Auth.
-        let url = base_url.trim_end_matches('/');
-        let auth_url = if let Some(rest) = url.strip_prefix("https://") {
-            format!("https://{username}:{password}@{rest}")
-        } else if let Some(rest) = url.strip_prefix("http://") {
-            format!("http://{username}:{password}@{rest}")
-        } else {
-            format!("https://{username}:{password}@{url}")
-        };
+        let url = base_url.trim_end_matches('/').to_string();
 
-        Self {
-            base_url: auth_url,
+        Ok(Self {
+            base_url: url,
             database: database.to_string(),
             client,
-        }
+        })
     }
 
     fn db_url(&self) -> String {
@@ -124,6 +127,34 @@ impl CouchDBClient {
     /// Fetch all note documents (non-leaf) from the database.
     pub async fn get_all_notes(&self) -> anyhow::Result<ChangesResponse> {
         self.get_changes("0", None).await
+    }
+
+    /// Fetch the PBKDF2 salt from the LiveSync config document.
+    ///
+    /// Self-hosted LiveSync stores the E2EE salt in `_local/obsidian-livesync-config`
+    /// (or `_local/obsidian-livesync`) under the `encryptedPassphraseSalt` field.
+    pub async fn get_e2ee_salt(&self) -> anyhow::Result<Vec<u8>> {
+        // Try the modern config document first, then the legacy one.
+        let config_ids = [
+            "_local/obsidian-livesync-config",
+            "_local/obsidian-livesync",
+        ];
+
+        for config_id in &config_ids {
+            let url = format!("{}/{}", self.db_url(), urlencoding::encode(config_id));
+            let resp = self.client.get(&url).send().await?;
+            if !resp.status().is_success() {
+                continue;
+            }
+
+            let doc: serde_json::Value = resp.json().await?;
+            if let Some(salt_hex) = doc.get("encryptedPassphraseSalt").and_then(|v| v.as_str()) {
+                return hex::decode(salt_hex)
+                    .map_err(|e| anyhow::anyhow!("invalid PBKDF2 salt hex: {e}"));
+            }
+        }
+
+        anyhow::bail!("PBKDF2 salt not found in CouchDB config documents")
     }
 
     /// Test the connection to CouchDB.
