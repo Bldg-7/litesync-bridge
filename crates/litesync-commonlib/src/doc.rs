@@ -146,3 +146,245 @@ pub struct AllDocsRow {
     #[serde(default)]
     pub error: Option<String>,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // =====================================================================
+    // RawNoteEntry deserialization
+    // =====================================================================
+
+    #[test]
+    fn test_raw_note_entry_full() {
+        let json = r#"{
+            "_id": "notes/hello.md",
+            "_rev": "1-abc",
+            "type": "plain",
+            "path": "notes/hello.md",
+            "ctime": 1000,
+            "mtime": 2000,
+            "size": 42,
+            "children": ["h:chunk1", "h:chunk2"],
+            "eden": {}
+        }"#;
+        let entry: RawNoteEntry = serde_json::from_str(json).unwrap();
+        assert_eq!(entry._id, "notes/hello.md");
+        assert_eq!(entry._rev, Some("1-abc".into()));
+        assert_eq!(entry.type_, "plain");
+        assert_eq!(entry.ctime, 1000);
+        assert_eq!(entry.mtime, 2000);
+        assert_eq!(entry.size, 42);
+        assert_eq!(entry.children.len(), 2);
+        assert!(entry.eden.is_empty());
+        assert_eq!(entry._deleted, None);
+    }
+
+    #[test]
+    fn test_raw_note_entry_minimal() {
+        // Only required fields; serde(default) fills the rest.
+        let json = r#"{
+            "_id": "test.md",
+            "type": "newnote",
+            "path": "test.md"
+        }"#;
+        let entry: RawNoteEntry = serde_json::from_str(json).unwrap();
+        assert_eq!(entry._id, "test.md");
+        assert_eq!(entry._rev, None);
+        assert_eq!(entry.type_, "newnote");
+        assert_eq!(entry.ctime, 0);
+        assert_eq!(entry.mtime, 0);
+        assert_eq!(entry.size, 0);
+        assert!(entry.children.is_empty());
+        assert!(entry.eden.is_empty());
+    }
+
+    #[test]
+    fn test_raw_note_entry_with_eden() {
+        let json = r#"{
+            "_id": "test.md",
+            "type": "plain",
+            "path": "test.md",
+            "eden": {
+                "h:chunk1": {"data": "base64data", "epoch": 5}
+            }
+        }"#;
+        let entry: RawNoteEntry = serde_json::from_str(json).unwrap();
+        assert_eq!(entry.eden.len(), 1);
+        let chunk = entry.eden.get("h:chunk1").unwrap();
+        assert_eq!(chunk.data, "base64data");
+        assert_eq!(chunk.epoch, 5);
+    }
+
+    #[test]
+    fn test_raw_note_entry_deleted() {
+        let json = r#"{
+            "_id": "deleted.md",
+            "type": "plain",
+            "path": "deleted.md",
+            "_deleted": true
+        }"#;
+        let entry: RawNoteEntry = serde_json::from_str(json).unwrap();
+        assert_eq!(entry._deleted, Some(true));
+    }
+
+    // =====================================================================
+    // Predicates
+    // =====================================================================
+
+    fn make_entry(type_: &str, path: &str) -> RawNoteEntry {
+        RawNoteEntry {
+            _id: "id".into(),
+            _rev: None,
+            type_: type_.into(),
+            path: path.into(),
+            ctime: 0, mtime: 0, size: 0,
+            children: vec![],
+            eden: HashMap::new(),
+            _deleted: None,
+        }
+    }
+
+    #[test]
+    fn test_is_note() {
+        assert!(make_entry("plain", "x").is_note());
+        assert!(make_entry("newnote", "x").is_note());
+        assert!(!make_entry("leaf", "x").is_note());
+    }
+
+    #[test]
+    fn test_is_binary() {
+        assert!(make_entry("newnote", "x").is_binary());
+        assert!(!make_entry("plain", "x").is_binary());
+    }
+
+    #[test]
+    fn test_is_deleted() {
+        let mut entry = make_entry("plain", "x");
+        assert!(!entry.is_deleted());
+        entry._deleted = Some(false);
+        assert!(!entry.is_deleted());
+        entry._deleted = Some(true);
+        assert!(entry.is_deleted());
+    }
+
+    #[test]
+    fn test_is_encrypted() {
+        assert!(make_entry("plain", "/\\:%=abc").is_encrypted());
+        assert!(!make_entry("plain", "notes/hello.md").is_encrypted());
+    }
+
+    // =====================================================================
+    // EntryLeaf deserialization
+    // =====================================================================
+
+    #[test]
+    fn test_entry_leaf() {
+        let json = r#"{
+            "_id": "h:chunk1",
+            "_rev": "1-def",
+            "type": "leaf",
+            "data": "SGVsbG8="
+        }"#;
+        let leaf: EntryLeaf = serde_json::from_str(json).unwrap();
+        assert_eq!(leaf._id, "h:chunk1");
+        assert_eq!(leaf.type_, "leaf");
+        assert_eq!(leaf.data, "SGVsbG8=");
+        assert_eq!(leaf.is_corrupted, None);
+    }
+
+    #[test]
+    fn test_entry_leaf_corrupted() {
+        let json = r#"{
+            "_id": "h:chunk1",
+            "type": "leaf",
+            "data": "",
+            "isCorrupted": true
+        }"#;
+        let leaf: EntryLeaf = serde_json::from_str(json).unwrap();
+        assert_eq!(leaf.is_corrupted, Some(true));
+    }
+
+    // =====================================================================
+    // CouchDB response types
+    // =====================================================================
+
+    #[test]
+    fn test_changes_response() {
+        let json = r#"{
+            "results": [
+                {
+                    "seq": "3-abc",
+                    "id": "notes/hello.md",
+                    "changes": [{"rev": "1-def"}],
+                    "doc": {"_id": "notes/hello.md", "type": "plain", "path": "notes/hello.md"}
+                }
+            ],
+            "last_seq": "3-abc"
+        }"#;
+        let resp: ChangesResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(resp.results.len(), 1);
+        assert_eq!(resp.results[0].id, "notes/hello.md");
+        assert_eq!(resp.results[0].changes[0].rev, "1-def");
+        assert!(resp.results[0].doc.is_some());
+        assert_eq!(resp.results[0].deleted, None);
+    }
+
+    #[test]
+    fn test_changes_response_deleted() {
+        let json = r#"{
+            "results": [
+                {
+                    "seq": 5,
+                    "id": "deleted.md",
+                    "changes": [{"rev": "2-ghi"}],
+                    "deleted": true
+                }
+            ],
+            "last_seq": 5
+        }"#;
+        let resp: ChangesResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(resp.results[0].deleted, Some(true));
+        assert!(resp.results[0].doc.is_none());
+    }
+
+    #[test]
+    fn test_all_docs_response() {
+        let json = r#"{
+            "total_rows": 100,
+            "rows": [
+                {
+                    "id": "h:chunk1",
+                    "doc": {"_id": "h:chunk1", "type": "leaf", "data": "SGVsbG8="}
+                },
+                {
+                    "id": "h:missing",
+                    "error": "not_found"
+                }
+            ]
+        }"#;
+        let resp: AllDocsResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(resp.total_rows, Some(100));
+        assert_eq!(resp.rows.len(), 2);
+        assert!(resp.rows[0].doc.is_some());
+        assert_eq!(resp.rows[0].error, None);
+        assert!(resp.rows[1].doc.is_none());
+        assert_eq!(resp.rows[1].error, Some("not_found".into()));
+    }
+
+    // =====================================================================
+    // Constants
+    // =====================================================================
+
+    #[test]
+    fn test_constants() {
+        assert_eq!(PREFIX_OBFUSCATED, "f:");
+        assert_eq!(PREFIX_CHUNK, "h:");
+        assert_eq!(ENCRYPTED_META_PREFIX, "/\\:");
+        assert_eq!(EDEN_ENCRYPTED_KEY, "h:++encrypted");
+        assert_eq!(EDEN_ENCRYPTED_KEY_HKDF, "h:++encrypted-hkdf");
+        assert_eq!(TYPE_PLAIN, "plain");
+        assert_eq!(TYPE_NEWNOTE, "newnote");
+        assert_eq!(TYPE_LEAF, "leaf");
+    }
+}

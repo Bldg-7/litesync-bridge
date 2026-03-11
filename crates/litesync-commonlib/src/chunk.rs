@@ -185,3 +185,267 @@ pub async fn reassemble(
 
     Ok(result)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::doc::{TYPE_PLAIN, TYPE_NEWNOTE};
+
+    // =====================================================================
+    // Test helpers
+    // =====================================================================
+
+    const TEST_PASSPHRASE: &str = "test-passphrase-for-unit-tests";
+    const TEST_PBKDF2_SALT: [u8; 32] = [0xAA; 32];
+    const TEST_IV: [u8; 12] = [0xBB; 12];
+    const TEST_HKDF_SALT: [u8; 32] = [0xCC; 32];
+
+    fn test_ctx() -> E2EEContext {
+        E2EEContext::new(TEST_PASSPHRASE, &TEST_PBKDF2_SALT)
+    }
+
+    /// Encrypt plaintext in `%=` format using test fixtures.
+    fn encrypt_hkdf(plaintext: &str, master_key: &[u8; 32]) -> String {
+        use aes_gcm::aead::Aead;
+        use aes_gcm::{Aes256Gcm, Key, KeyInit, Nonce};
+        use base64::engine::general_purpose::STANDARD as B64;
+        use base64::Engine;
+        use hkdf::Hkdf;
+        use sha2::Sha256;
+
+        let hk = Hkdf::<Sha256>::new(Some(&TEST_HKDF_SALT), master_key);
+        let mut chunk_key = [0u8; 32];
+        hk.expand(&[], &mut chunk_key).unwrap();
+
+        let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&chunk_key));
+        let ciphertext = cipher.encrypt(Nonce::from_slice(&TEST_IV), plaintext.as_bytes()).unwrap();
+
+        let mut binary = Vec::new();
+        binary.extend_from_slice(&TEST_IV);
+        binary.extend_from_slice(&TEST_HKDF_SALT);
+        binary.extend_from_slice(&ciphertext);
+
+        format!("%={}", B64.encode(&binary))
+    }
+
+    fn make_raw(path: &str, type_: &str) -> RawNoteEntry {
+        RawNoteEntry {
+            _id: "doc-id".into(),
+            _rev: Some("1-abc".into()),
+            type_: type_.into(),
+            path: path.into(),
+            ctime: 100, mtime: 200, size: 50,
+            children: vec!["h:c1".into(), "h:c2".into()],
+            eden: HashMap::new(),
+            _deleted: None,
+        }
+    }
+
+    fn make_encrypted_path(master_key: &[u8; 32], meta_json: &str) -> String {
+        let encrypted = encrypt_hkdf(meta_json, master_key);
+        format!("/\\:{encrypted}")
+    }
+
+    // =====================================================================
+    // E2EEContext
+    // =====================================================================
+
+    #[test]
+    fn test_e2ee_context_caches_master_key() {
+        let ctx = test_ctx();
+        let expected = crypto::derive_master_key(TEST_PASSPHRASE, &TEST_PBKDF2_SALT);
+        assert_eq!(ctx.master_key, expected);
+        assert_eq!(ctx.passphrase, TEST_PASSPHRASE);
+        assert_eq!(ctx.pbkdf2_salt, TEST_PBKDF2_SALT);
+    }
+
+    #[test]
+    fn test_e2ee_context_deterministic() {
+        let ctx1 = E2EEContext::new("pp", &[1u8; 32]);
+        let ctx2 = E2EEContext::new("pp", &[1u8; 32]);
+        assert_eq!(ctx1.master_key, ctx2.master_key);
+    }
+
+    // =====================================================================
+    // resolve_note — non-encrypted
+    // =====================================================================
+
+    #[test]
+    fn test_resolve_note_plain() {
+        let raw = make_raw("notes/hello.md", TYPE_PLAIN);
+        let note = resolve_note(&raw, None, None).unwrap();
+        assert_eq!(note.id, "doc-id");
+        assert_eq!(note.rev, Some("1-abc".into()));
+        assert_eq!(note.path, "notes/hello.md");
+        assert_eq!(note.ctime, 100);
+        assert_eq!(note.mtime, 200);
+        assert_eq!(note.size, 50);
+        assert_eq!(note.children, vec!["h:c1", "h:c2"]);
+        assert!(!note.deleted);
+        assert!(!note.is_binary);
+    }
+
+    #[test]
+    fn test_resolve_note_binary() {
+        let raw = make_raw("image.png", TYPE_NEWNOTE);
+        let note = resolve_note(&raw, None, None).unwrap();
+        assert!(note.is_binary);
+    }
+
+    // =====================================================================
+    // resolve_note — deletion
+    // =====================================================================
+
+    #[test]
+    fn test_resolve_note_deleted_from_body() {
+        let mut raw = make_raw("x.md", TYPE_PLAIN);
+        raw._deleted = Some(true);
+        let note = resolve_note(&raw, None, None).unwrap();
+        assert!(note.deleted);
+    }
+
+    #[test]
+    fn test_resolve_note_deleted_from_change_feed() {
+        let raw = make_raw("x.md", TYPE_PLAIN);
+        let note = resolve_note(&raw, None, Some(true)).unwrap();
+        assert!(note.deleted);
+    }
+
+    #[test]
+    fn test_resolve_note_not_deleted() {
+        let raw = make_raw("x.md", TYPE_PLAIN);
+        let note = resolve_note(&raw, None, Some(false)).unwrap();
+        assert!(!note.deleted);
+    }
+
+    #[test]
+    fn test_resolve_note_deleted_either_source() {
+        // change_deleted=false but _deleted=true → deleted
+        let mut raw = make_raw("x.md", TYPE_PLAIN);
+        raw._deleted = Some(true);
+        let note = resolve_note(&raw, None, Some(false)).unwrap();
+        assert!(note.deleted);
+    }
+
+    // =====================================================================
+    // resolve_note — encrypted metadata
+    // =====================================================================
+
+    #[test]
+    fn test_resolve_note_encrypted() {
+        let ctx = test_ctx();
+        let meta_json = r#"{"path":"secret/note.md","mtime":9000,"ctime":8000,"size":123,"children":["h:x1","h:x2","h:x3"]}"#;
+        let encrypted_path = make_encrypted_path(&ctx.master_key, meta_json);
+
+        let mut raw = make_raw(&encrypted_path, TYPE_PLAIN);
+        raw.ctime = 0; raw.mtime = 0; raw.size = 0; // zeroed when encrypted
+        raw.children = vec![]; // may be empty in encrypted mode
+
+        let note = resolve_note(&raw, Some(&ctx), None).unwrap();
+        assert_eq!(note.path, "secret/note.md");
+        assert_eq!(note.mtime, 9000);
+        assert_eq!(note.ctime, 8000);
+        assert_eq!(note.size, 123);
+        assert_eq!(note.children, vec!["h:x1", "h:x2", "h:x3"]);
+    }
+
+    #[test]
+    fn test_resolve_note_encrypted_children_fallback() {
+        // Older plugin versions: encrypted meta has empty children,
+        // raw.children has the real list.
+        let ctx = test_ctx();
+        let meta_json = r#"{"path":"old.md","mtime":1,"ctime":1,"size":1,"children":[]}"#;
+        let encrypted_path = make_encrypted_path(&ctx.master_key, meta_json);
+
+        let mut raw = make_raw(&encrypted_path, TYPE_PLAIN);
+        raw.children = vec!["h:fallback1".into(), "h:fallback2".into()];
+
+        let note = resolve_note(&raw, Some(&ctx), None).unwrap();
+        assert_eq!(note.children, vec!["h:fallback1", "h:fallback2"]);
+    }
+
+    #[test]
+    fn test_resolve_note_encrypted_no_context_fails() {
+        let ctx = test_ctx();
+        let meta_json = r#"{"path":"x.md","mtime":0,"ctime":0,"size":0}"#;
+        let encrypted_path = make_encrypted_path(&ctx.master_key, meta_json);
+        let raw = make_raw(&encrypted_path, TYPE_PLAIN);
+
+        let result = resolve_note(&raw, None, None);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("no E2EE context"));
+    }
+
+    // =====================================================================
+    // resolve_note — eden decryption
+    // =====================================================================
+
+    #[test]
+    fn test_resolve_note_empty_eden() {
+        let raw = make_raw("x.md", TYPE_PLAIN);
+        let note = resolve_note(&raw, None, None).unwrap();
+        assert!(note.eden.is_empty());
+    }
+
+    #[test]
+    fn test_resolve_note_unencrypted_eden() {
+        let mut raw = make_raw("x.md", TYPE_PLAIN);
+        raw.eden.insert("h:inline1".into(), EdenChunk {
+            data: "aW5saW5l".into(),
+            epoch: 1,
+        });
+        let note = resolve_note(&raw, None, None).unwrap();
+        assert_eq!(note.eden.len(), 1);
+        assert_eq!(note.eden.get("h:inline1").unwrap().data, "aW5saW5l");
+    }
+
+    #[test]
+    fn test_resolve_note_encrypted_eden_sentinel() {
+        let ctx = test_ctx();
+
+        // Build the decrypted eden content.
+        let eden_json = r#"{"h:real1":{"data":"Y2h1bms=","epoch":1},"h:real2":{"data":"ZGF0YQ==","epoch":2}}"#;
+        let encrypted_sentinel = encrypt_hkdf(eden_json, &ctx.master_key);
+
+        // Build raw entry with encrypted metadata + encrypted eden.
+        let meta_json = r#"{"path":"eden-test.md","mtime":1,"ctime":1,"size":1,"children":["h:real1","h:real2"]}"#;
+        let encrypted_path = make_encrypted_path(&ctx.master_key, meta_json);
+
+        let mut raw = make_raw(&encrypted_path, TYPE_PLAIN);
+        raw.children = vec![];
+        raw.eden = HashMap::new();
+        raw.eden.insert(EDEN_ENCRYPTED_KEY_HKDF.into(), EdenChunk {
+            data: encrypted_sentinel,
+            epoch: 0,
+        });
+
+        let note = resolve_note(&raw, Some(&ctx), None).unwrap();
+        assert_eq!(note.eden.len(), 2);
+        assert_eq!(note.eden.get("h:real1").unwrap().data, "Y2h1bms=");
+        assert_eq!(note.eden.get("h:real2").unwrap().data, "ZGF0YQ==");
+        assert_eq!(note.eden.get("h:real2").unwrap().epoch, 2);
+    }
+
+    #[test]
+    fn test_resolve_note_encrypted_eden_legacy_key() {
+        // Uses EDEN_ENCRYPTED_KEY (without -hkdf) as fallback.
+        let ctx = test_ctx();
+        let eden_json = r#"{"h:legacy":{"data":"bGVn","epoch":1}}"#;
+        let encrypted_sentinel = encrypt_hkdf(eden_json, &ctx.master_key);
+
+        let meta_json = r#"{"path":"legacy.md","mtime":1,"ctime":1,"size":1,"children":["h:legacy"]}"#;
+        let encrypted_path = make_encrypted_path(&ctx.master_key, meta_json);
+
+        let mut raw = make_raw(&encrypted_path, TYPE_PLAIN);
+        raw.children = vec![];
+        raw.eden = HashMap::new();
+        raw.eden.insert(EDEN_ENCRYPTED_KEY.into(), EdenChunk {
+            data: encrypted_sentinel,
+            epoch: 0,
+        });
+
+        let note = resolve_note(&raw, Some(&ctx), None).unwrap();
+        assert_eq!(note.eden.len(), 1);
+        assert_eq!(note.eden.get("h:legacy").unwrap().data, "bGVn");
+    }
+}
