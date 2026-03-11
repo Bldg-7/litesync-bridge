@@ -1,0 +1,36 @@
+[package]
+name = "litesync-commonlib"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Rust implementation of Self-hosted LiveSync protocol (E2EE, chunking, CouchDB document format)"
+
+[dependencies]
+# HTTP / CouchDB
+reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
+tokio = { version = "1", features = ["full"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Encryption (E2EE)
+aes-gcm = "0.10"
+hkdf = "0.12"
+sha2 = "0.10"
+
+# Hashing
+xxhash-rust = { version = "0.8", features = ["xxh32", "xxh64"] }
+
+# Compression
+flate2 = "1"
+
+# Binary / String
+base64 = "0.22"
+hex = "0.4"
+
+# Utilities
+tracing = "0.1"
+anyhow = "1"
+thiserror = "2"
