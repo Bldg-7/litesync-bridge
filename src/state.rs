@@ -1,6 +1,7 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 /// Tracks the CouchDB `since` sequence for a peer.
 ///
@@ -51,26 +52,67 @@ impl SinceTracker {
 }
 
 /// Tracks recent file writes to prevent sync loops in StoragePeer.
+///
+/// Uses a time-window approach: writes within [`WRITE_SUPPRESS_WINDOW`] are
+/// considered "own writes". Stale entries are cleaned up on access, preventing
+/// unbounded growth.
 pub struct WriteTracker {
-    paths: Mutex<HashSet<PathBuf>>,
+    writes: Mutex<HashMap<PathBuf, Instant>>,
 }
+
+const WRITE_SUPPRESS_WINDOW: Duration = Duration::from_secs(1);
 
 impl WriteTracker {
     pub fn new() -> Self {
         Self {
-            paths: Mutex::new(HashSet::new()),
+            writes: Mutex::new(HashMap::new()),
         }
     }
 
     /// Record that we just wrote to this path.
     pub fn record(&self, path: PathBuf) {
-        self.paths.lock().unwrap().insert(path);
+        self.writes.lock().unwrap().insert(path, Instant::now());
     }
 
-    /// Check if this path was recently written by us, and remove it from tracking.
+    /// Check if this path was recently written by us (within the suppress window).
     /// Returns `true` if it was our write (caller should skip the event).
-    pub fn check_and_remove(&self, path: &Path) -> bool {
-        self.paths.lock().unwrap().remove(path)
+    /// Stale entries are removed on access.
+    pub fn is_own_write(&self, path: &Path) -> bool {
+        let mut map = self.writes.lock().unwrap();
+        match map.get(path) {
+            Some(t) if t.elapsed() < WRITE_SUPPRESS_WINDOW => true,
+            Some(_) => {
+                map.remove(path);
+                false
+            }
+            None => false,
+        }
+    }
+}
+
+/// In-memory cache mapping CouchDB doc IDs to resolved relative paths.
+///
+/// Used to resolve paths for deleted documents where the tombstone may not
+/// contain enough information (e.g., obfuscated IDs).
+pub struct PathCache {
+    map: Mutex<HashMap<String, String>>,
+}
+
+impl PathCache {
+    pub fn new() -> Self {
+        Self {
+            map: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Cache a doc_id → rel_path mapping.
+    pub fn insert(&self, doc_id: String, rel_path: String) {
+        self.map.lock().unwrap().insert(doc_id, rel_path);
+    }
+
+    /// Look up the cached relative path for a doc_id.
+    pub fn get(&self, doc_id: &str) -> Option<String> {
+        self.map.lock().unwrap().get(doc_id).cloned()
     }
 }
 

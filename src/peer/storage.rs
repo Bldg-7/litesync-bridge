@@ -123,7 +123,7 @@ impl StoragePeer {
                 }
 
                 // Skip our own writes
-                if self.write_tracker.check_and_remove(event_path) {
+                if self.write_tracker.is_own_write(event_path) {
                     tracing::trace!(peer = %self.name, path = %rel_str, "skipping own write");
                     continue;
                 }
