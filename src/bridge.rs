@@ -1,4 +1,5 @@
 use std::path::PathBuf;
+use std::sync::Arc;
 
 /// A file change event dispatched between peers.
 #[derive(Debug, Clone)]
@@ -27,7 +28,7 @@ impl ChangeEvent {
 /// Message sent from a peer to the Hub for routing.
 #[derive(Debug, Clone)]
 pub struct PeerMessage {
-    pub source_name: String,
-    pub group: String,
+    pub source_name: Arc<str>,
+    pub group: Arc<str>,
     pub event: ChangeEvent,
 }

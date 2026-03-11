@@ -14,8 +14,8 @@ use crate::config::StoragePeerConfig;
 use crate::state::WriteTracker;
 
 pub struct StoragePeer {
-    name: String,
-    group: String,
+    name: Arc<str>,
+    group: Arc<str>,
     base_dir: std::path::PathBuf,
     write_tracker: WriteTracker,
 }
@@ -23,8 +23,8 @@ pub struct StoragePeer {
 impl StoragePeer {
     pub fn new(config: StoragePeerConfig) -> Self {
         Self {
-            name: config.name,
-            group: config.group,
+            name: Arc::from(config.name),
+            group: Arc::from(config.group),
             base_dir: config.base_dir,
             write_tracker: WriteTracker::new(),
         }

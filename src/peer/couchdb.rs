@@ -37,8 +37,8 @@ fn is_hidden_path(rel_path: &str) -> bool {
 }
 
 pub struct CouchDBPeer {
-    name: String,
-    group: String,
+    name: Arc<str>,
+    group: Arc<str>,
     base_dir: String,
     obfuscate_passphrase: Option<String>,
     client: CouchDBClient,
@@ -83,8 +83,8 @@ impl CouchDBPeer {
         };
 
         let peer = Self {
-            name: config.name,
-            group: config.group,
+            name: Arc::from(config.name),
+            group: Arc::from(config.group),
             base_dir,
             obfuscate_passphrase: config.obfuscate_passphrase,
             client,

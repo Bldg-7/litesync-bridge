@@ -63,6 +63,12 @@ pub struct WriteTracker {
 
 const WRITE_SUPPRESS_WINDOW: Duration = Duration::from_secs(1);
 
+impl Default for WriteTracker {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl WriteTracker {
     pub fn new() -> Self {
         Self {
@@ -103,6 +109,12 @@ pub struct PathCache {
 /// Maximum number of entries in PathCache. 50K docs × ~200 bytes ≈ 10 MB.
 const PATH_CACHE_MAX: usize = 50_000;
 
+impl Default for PathCache {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl PathCache {
     pub fn new() -> Self {
         Self {
@@ -142,6 +154,12 @@ pub struct RevTracker {
 /// Revisions older than this are considered stale and can be removed.
 /// 5 minutes covers worst-case changes feed lag.
 const REV_TTL: Duration = Duration::from_secs(300);
+
+impl Default for RevTracker {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl RevTracker {
     pub fn new() -> Self {

@@ -74,8 +74,8 @@ impl Hub {
             );
 
             for (name, tx) in &peer_txs {
-                if name != &msg.source_name
-                    && peer_groups.get(name).map(String::as_str) == Some(&msg.group)
+                if name.as_str() != &*msg.source_name
+                    && peer_groups.get(name).map(String::as_str) == Some(&*msg.group)
                 {
                     match tx.try_send(msg.event.clone()) {
                         Ok(()) => {}

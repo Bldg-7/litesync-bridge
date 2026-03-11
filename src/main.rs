@@ -40,7 +40,12 @@ async fn main() -> anyhow::Result<()> {
     );
 
     let config = config::Config::load(&cli.config)?;
-    let data_dir = cli.config.parent().unwrap_or(Path::new(".")).to_path_buf();
+    let data_dir = cli
+        .config
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."))
+        .to_path_buf();
 
     if cli.reset {
         tracing::info!("resetting all peer state");
