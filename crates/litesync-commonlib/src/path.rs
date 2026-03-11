@@ -117,7 +117,7 @@ fn hash_string_chain(key: &str) -> String {
     sha256_hex(key)
 }
 
-fn sha256_hex(input: &str) -> String {
+pub(crate) fn sha256_hex(input: &str) -> String {
     hex::encode(sha256_bytes(input.as_bytes()))
 }
 

@@ -5,7 +5,7 @@ use reqwest::Client;
 use serde::de::DeserializeOwned;
 use serde_json::json;
 
-use crate::doc::{AllDocsResponse, ChangesResponse, EntryLeaf, TYPE_LEAF};
+use crate::doc::{AllDocsResponse, BulkDocResult, ChangesResponse, EntryLeaf, PutResponse, TYPE_LEAF};
 
 /// HTTP client for CouchDB operations.
 #[derive(Clone)]
@@ -174,5 +174,90 @@ impl CouchDBClient {
             anyhow::bail!("CouchDB ping failed: {status}");
         }
         Ok(())
+    }
+
+    // =================================================================
+    // Phase 2: Write operations
+    // =================================================================
+
+    /// Write a document to CouchDB via PUT.
+    ///
+    /// If the document already exists, `_rev` must be set to the current
+    /// revision to avoid a 409 Conflict.
+    pub async fn put_doc<T: serde::Serialize>(
+        &self,
+        id: &str,
+        doc: &T,
+    ) -> anyhow::Result<PutResponse> {
+        let url = format!("{}/{}", self.db_url(), urlencoding::encode(id));
+        let resp = self.client.put(&url).json(doc).send().await?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            anyhow::bail!("PUT {id}: {status} — {body}");
+        }
+
+        Ok(resp.json().await?)
+    }
+
+    /// Write multiple chunk documents in a single batch via `_bulk_docs`.
+    ///
+    /// Chunks that already exist (409 conflict) are silently skipped,
+    /// since chunk IDs are content-addressed and immutable.
+    pub async fn put_chunks(&self, chunks: &[EntryLeaf]) -> anyhow::Result<()> {
+        if chunks.is_empty() {
+            return Ok(());
+        }
+
+        let url = format!("{}/_bulk_docs", self.db_url());
+        let body = json!({ "docs": chunks });
+
+        let resp = self.client.post(&url).json(&body).send().await?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let text = resp.text().await.unwrap_or_default();
+            anyhow::bail!("_bulk_docs: {status} — {text}");
+        }
+
+        let results: Vec<BulkDocResult> = resp.json().await?;
+        for result in &results {
+            if let Some(error) = &result.error {
+                // 409 conflict is expected for content-addressed chunks
+                // that already exist — skip silently.
+                if error == "conflict" {
+                    continue;
+                }
+                let reason = result.reason.as_deref().unwrap_or("unknown");
+                anyhow::bail!(
+                    "failed to write chunk {}: {} — {}",
+                    result.id, error, reason
+                );
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Delete a document by ID and revision.
+    ///
+    /// CouchDB requires the current `_rev` to delete a document.
+    pub async fn delete_doc(&self, id: &str, rev: &str) -> anyhow::Result<PutResponse> {
+        let url = format!("{}/{}", self.db_url(), urlencoding::encode(id));
+        let resp = self
+            .client
+            .delete(&url)
+            .query(&[("rev", rev)])
+            .send()
+            .await?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            anyhow::bail!("DELETE {id}: {status} — {body}");
+        }
+
+        Ok(resp.json().await?)
     }
 }

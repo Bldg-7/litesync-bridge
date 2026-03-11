@@ -33,6 +33,9 @@ flate2 = "1"
 base64 = "0.22"
 hex = "0.4"
 
+# Random
+getrandom = "0.2"
+
 # Utilities
 tracing = "0.1"
 anyhow = "1"

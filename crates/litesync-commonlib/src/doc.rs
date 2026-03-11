@@ -30,12 +30,12 @@ pub struct EdenChunk {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct EntryLeaf {
     pub _id: String,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub _rev: Option<String>,
     #[serde(rename = "type")]
     pub type_: String,
     pub data: String,
-    #[serde(default, rename = "isCorrupted")]
+    #[serde(default, rename = "isCorrupted", skip_serializing_if = "Option::is_none")]
     pub is_corrupted: Option<bool>,
 }
 
@@ -45,7 +45,7 @@ pub struct EntryLeaf {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct RawNoteEntry {
     pub _id: String,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub _rev: Option<String>,
     #[serde(rename = "type")]
     pub type_: String,
@@ -60,7 +60,7 @@ pub struct RawNoteEntry {
     pub children: Vec<String>,
     #[serde(default)]
     pub eden: HashMap<String, EdenChunk>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub _deleted: Option<bool>,
 }
 
@@ -145,6 +145,29 @@ pub struct AllDocsRow {
     pub doc: Option<EntryLeaf>,
     #[serde(default)]
     pub error: Option<String>,
+}
+
+// --- CouchDB Write Response Types ---
+
+/// Response from a CouchDB PUT/POST document operation.
+#[derive(Debug, Deserialize)]
+pub struct PutResponse {
+    pub ok: bool,
+    pub id: String,
+    pub rev: String,
+}
+
+/// Response from CouchDB `_bulk_docs` batch write.
+#[derive(Debug, Deserialize)]
+pub struct BulkDocResult {
+    pub ok: Option<bool>,
+    pub id: String,
+    #[serde(default)]
+    pub rev: Option<String>,
+    #[serde(default)]
+    pub error: Option<String>,
+    #[serde(default)]
+    pub reason: Option<String>,
 }
 
 #[cfg(test)]
@@ -375,6 +398,91 @@ mod tests {
     // =====================================================================
     // Constants
     // =====================================================================
+
+    // =====================================================================
+    // Phase 2: Write response types
+    // =====================================================================
+
+    #[test]
+    fn test_put_response() {
+        let json = r#"{"ok": true, "id": "doc-id", "rev": "1-abc"}"#;
+        let resp: super::PutResponse = serde_json::from_str(json).unwrap();
+        assert!(resp.ok);
+        assert_eq!(resp.id, "doc-id");
+        assert_eq!(resp.rev, "1-abc");
+    }
+
+    #[test]
+    fn test_bulk_doc_result_success() {
+        let json = r#"{"ok": true, "id": "h:chunk1", "rev": "1-xyz"}"#;
+        let result: super::BulkDocResult = serde_json::from_str(json).unwrap();
+        assert_eq!(result.ok, Some(true));
+        assert_eq!(result.id, "h:chunk1");
+        assert_eq!(result.rev, Some("1-xyz".into()));
+        assert_eq!(result.error, None);
+    }
+
+    #[test]
+    fn test_bulk_doc_result_conflict() {
+        let json = r#"{"id": "h:chunk1", "error": "conflict", "reason": "Document update conflict."}"#;
+        let result: super::BulkDocResult = serde_json::from_str(json).unwrap();
+        assert_eq!(result.error, Some("conflict".into()));
+        assert_eq!(result.reason, Some("Document update conflict.".into()));
+        assert_eq!(result.ok, None);
+    }
+
+    #[test]
+    fn test_entry_leaf_serialization_roundtrip() {
+        let leaf = EntryLeaf {
+            _id: "h:test".into(),
+            _rev: None,
+            type_: "leaf".into(),
+            data: "SGVsbG8=".into(),
+            is_corrupted: None,
+        };
+        let json = serde_json::to_string(&leaf).unwrap();
+        let parsed: EntryLeaf = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed._id, "h:test");
+        assert_eq!(parsed.data, "SGVsbG8=");
+        assert_eq!(parsed.type_, "leaf");
+    }
+
+    #[test]
+    fn test_entry_leaf_serialization_omits_none_fields() {
+        // CouchDB rejects `"_rev": null` — must be omitted.
+        let leaf = EntryLeaf {
+            _id: "h:test".into(),
+            _rev: None,
+            type_: "leaf".into(),
+            data: "SGVsbG8=".into(),
+            is_corrupted: None,
+        };
+        let json = serde_json::to_string(&leaf).unwrap();
+        assert!(!json.contains("_rev"), "None _rev should be omitted: {json}");
+        assert!(!json.contains("isCorrupted"), "None isCorrupted should be omitted: {json}");
+    }
+
+    #[test]
+    fn test_entry_leaf_serialization_includes_some_fields() {
+        let leaf = EntryLeaf {
+            _id: "h:test".into(),
+            _rev: Some("1-abc".into()),
+            type_: "leaf".into(),
+            data: "SGVsbG8=".into(),
+            is_corrupted: Some(false),
+        };
+        let json = serde_json::to_string(&leaf).unwrap();
+        assert!(json.contains("\"_rev\":\"1-abc\""), "Some _rev should be included: {json}");
+        assert!(json.contains("\"isCorrupted\":false"), "Some isCorrupted should be included: {json}");
+    }
+
+    #[test]
+    fn test_raw_note_entry_serialization_omits_none() {
+        let entry = make_entry("plain", "test.md");
+        let json = serde_json::to_string(&entry).unwrap();
+        assert!(!json.contains("\"_rev\":null"), "_rev null should be omitted: {json}");
+        assert!(!json.contains("\"_deleted\":null"), "_deleted null should be omitted: {json}");
+    }
 
     #[test]
     fn test_constants() {

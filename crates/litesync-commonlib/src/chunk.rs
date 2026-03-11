@@ -3,9 +3,13 @@ use base64::Engine;
 
 use crate::couchdb::CouchDBClient;
 use crate::crypto;
+use crate::path;
 use std::collections::HashMap;
 
-use crate::doc::{EdenChunk, NoteEntry, RawNoteEntry, ENCRYPTED_META_PREFIX, EDEN_ENCRYPTED_KEY, EDEN_ENCRYPTED_KEY_HKDF};
+use crate::doc::{
+    EdenChunk, EntryLeaf, NoteEntry, RawNoteEntry, ENCRYPTED_META_PREFIX,
+    EDEN_ENCRYPTED_KEY, EDEN_ENCRYPTED_KEY_HKDF, PREFIX_CHUNK, TYPE_LEAF,
+};
 
 /// Encryption context for decrypting E2EE-protected data.
 ///
@@ -162,6 +166,8 @@ pub async fn reassemble(
     }
 
     // Decrypt and decode each chunk, then concatenate.
+    // Text files: chunks are raw text strings → UTF-8 bytes directly.
+    // Binary files: chunks are base64 strings → decode to bytes.
     let mut result = Vec::new();
     for (i, data_opt) in chunk_data.into_iter().enumerate() {
         let raw_data = data_opt.ok_or_else(|| {
@@ -179,11 +185,379 @@ pub async fn reassemble(
             raw_data
         };
 
-        let bytes = BASE64.decode(&decoded_data)?;
-        result.extend_from_slice(&bytes);
+        if entry.is_binary {
+            // Binary: chunk data is base64-encoded
+            let bytes = BASE64.decode(&decoded_data)?;
+            result.extend_from_slice(&bytes);
+        } else {
+            // Text: chunk data is raw text
+            result.extend_from_slice(decoded_data.as_bytes());
+        }
     }
 
     Ok(result)
+}
+
+// =========================================================================
+// Phase 2: Write path (chunk splitting, ID generation, disassembly)
+// =========================================================================
+
+// --- Passphrase hashing (MurmurHash3 + FNV-1a) ---
+// Replicates the `fallbackMixedHashEach` from octagonal-wheels/hash/purejs.
+
+const SALT_OF_ID: &str = "a83hrf7f\u{0003}y7sa8g31";
+const EPOCH_FNV1A: u32 = 2_166_136_261;
+const MURMUR_C1: u32 = 0xcc9e_2d51;
+const MURMUR_C2: u32 = 0x1b87_3593;
+const MURMUR_N: u32 = 0xe654_6b64;
+
+/// Replicate JS `Math.imul(a, b)` — 32-bit truncating multiply.
+fn imul(a: u32, b: u32) -> u32 {
+    a.wrapping_mul(b)
+}
+
+/// Replicate the TS `mixedHash(str, seed, fnv1aHash)` function.
+///
+/// Processes each UTF-16 code unit of the input string through both
+/// MurmurHash3 and FNV-1a, matching the JS `.charCodeAt(i)` semantics.
+fn mixed_hash(input: &str, seed: u32, fnv1a_init: u32) -> (u32, u32) {
+    let mut h1 = seed;
+    let mut fnv = fnv1a_init;
+    let mut len: u32 = 0;
+
+    // JS iterates by UTF-16 code units via str.charCodeAt(i)
+    for ch in input.chars() {
+        let mut buf = [0u16; 2];
+        let code_units = ch.encode_utf16(&mut buf);
+        for &mut cu in code_units {
+            let k1_init = cu as u32;
+
+            // FNV-1a
+            fnv ^= k1_init;
+            fnv = imul(fnv, 0x0100_0193);
+
+            // MurmurHash3 inner loop
+            let mut k1 = imul(k1_init, MURMUR_C1);
+            k1 = k1.rotate_left(15);
+            k1 = imul(k1, MURMUR_C2);
+            h1 ^= k1;
+            h1 = h1.rotate_left(13);
+            h1 = h1.wrapping_mul(5).wrapping_add(MURMUR_N);
+
+            len += 1;
+        }
+    }
+
+    // MurmurHash3 finalization
+    h1 ^= len;
+    h1 ^= h1 >> 16;
+    h1 = imul(h1, 0x85eb_ca6b);
+    h1 ^= h1 >> 13;
+    h1 = imul(h1, 0xc2b2_ae35);
+    h1 ^= h1 >> 16;
+
+    (h1, fnv)
+}
+
+/// Replicate the TS `fallbackMixedHashEach(src)` function.
+///
+/// Returns the concatenation of MurmurHash3 and FNV-1a results in base-36.
+fn fallback_mixed_hash_each(src: &str) -> String {
+    // TS: mixedHash(`${src.length}${src}`, 1, epochFNV1a)
+    // src.length is the UTF-16 code unit count
+    let utf16_len: usize = src.chars().map(|c| c.len_utf16()).sum();
+    let input = format!("{}{}", utf16_len, src);
+    let (m, f) = mixed_hash(&input, 1, EPOCH_FNV1A);
+    format!("{}{}", u32_to_base36(m), u32_to_base36(f))
+}
+
+fn u32_to_base36(n: u32) -> String {
+    u64_to_base36(n as u64)
+}
+
+/// Compute the hashed passphrase for chunk ID generation.
+///
+/// Replicates `HashManagerCore.applyOptions` from the TS LiveSync plugin:
+/// 1. Truncate passphrase to 75% length (UTF-16 code units)
+/// 2. Prepend `SALT_OF_ID`
+/// 3. Hash with MurmurHash3 + FNV-1a (`fallbackMixedHashEach`)
+fn hash_passphrase_for_chunks(passphrase: &str) -> String {
+    let total_utf16_len: usize = passphrase.chars().map(|c| c.len_utf16()).sum();
+    let using_letters = (total_utf16_len / 4) * 3;
+
+    // Take first `using_letters` UTF-16 code units worth of chars
+    let mut taken = 0;
+    let truncated: String = passphrase
+        .chars()
+        .take_while(|c| {
+            if taken >= using_letters {
+                return false;
+            }
+            taken += c.len_utf16();
+            taken <= using_letters
+        })
+        .collect();
+
+    let salted = format!("{}{}", SALT_OF_ID, truncated);
+    fallback_mixed_hash_each(&salted)
+}
+
+/// Compute a content-addressed chunk ID using xxhash64.
+///
+/// Replicates the LiveSync `XXHash64HashManager.computeHash` algorithm:
+/// - With passphrase: `h64("{piece}-{hashedPassphrase}-{piece.utf16_len}")` in base-36
+/// - Without passphrase: `h64("{piece}-{piece.utf16_len}")` in base-36
+///
+/// Where `hashedPassphrase` is MurmurHash3+FNV-1a of `SALT_OF_ID + passphrase[0..75%]`.
+/// The `piece_utf16_len` uses UTF-16 code unit count to match JS `piece.length`.
+///
+/// The returned ID includes the `h:` prefix (e.g., `"h:1a2b3c"`).
+pub fn chunk_id(piece: &str, passphrase: Option<&str>) -> String {
+    let piece_utf16_len: usize = piece.chars().map(|c| c.len_utf16()).sum();
+
+    let hash_input = if let Some(pp) = passphrase {
+        let hashed_pp = hash_passphrase_for_chunks(pp);
+        format!("{}-{}-{}", piece, hashed_pp, piece_utf16_len)
+    } else {
+        format!("{}-{}", piece, piece_utf16_len)
+    };
+
+    let hash = xxhash_rust::xxh64::xxh64(hash_input.as_bytes(), 0);
+    format!("{}{}", PREFIX_CHUNK, u64_to_base36(hash))
+}
+
+fn u64_to_base36(mut n: u64) -> String {
+    if n == 0 {
+        return "0".to_string();
+    }
+    const DIGITS: &[u8] = b"0123456789abcdefghijklmnopqrstuvwxyz";
+    let mut buf = Vec::new();
+    while n > 0 {
+        buf.push(DIGITS[(n % 36) as usize]);
+        n /= 36;
+    }
+    buf.reverse();
+    String::from_utf8(buf).unwrap()
+}
+
+/// Split text content into raw text chunks using newline-aware splitting.
+///
+/// Replicates the LiveSync `splitPieces2V2` text path:
+/// 1. Split by newline delimiter with minimum chunk length
+/// 2. Cap each piece at `piece_size` characters (UTF-16 code units to match JS)
+///
+/// Each yielded piece is a raw text string (NOT base64-encoded), matching
+/// the TS plugin's behavior for text files.
+pub fn split_text(content: &str, piece_size: usize, minimum_chunk_size: usize) -> Vec<String> {
+    if content.is_empty() {
+        return vec![];
+    }
+
+    // Adaptive minimum: grow until pieces count <= MAX_ITEMS
+    // Uses UTF-16 code unit count to match JS `text.length`
+    let max_items = 100;
+    let content_utf16_len: usize = content.chars().map(|c| c.len_utf16()).sum();
+    let mut min_size = minimum_chunk_size;
+    while content_utf16_len / min_size > max_items && min_size < content_utf16_len {
+        min_size += minimum_chunk_size;
+    }
+
+    // Phase 1: split by newline with minimum chunk length (UTF-16 code units)
+    let mut segments = Vec::new();
+    let mut buf = String::new();
+    let mut buf_utf16_len: usize = 0;
+
+    let mut chars = content.char_indices().peekable();
+    let mut start = 0;
+    while let Some((i, ch)) = chars.next() {
+        if ch == '\n' {
+            // Consume consecutive newlines
+            let mut end = i + 1;
+            while let Some(&(next_i, '\n')) = chars.peek() {
+                end = next_i + 1;
+                chars.next();
+            }
+            let slice = &content[start..end];
+            buf.push_str(slice);
+            buf_utf16_len += slice.chars().map(|c| c.len_utf16()).sum::<usize>();
+            start = end;
+
+            if buf_utf16_len >= min_size {
+                segments.push(std::mem::take(&mut buf));
+                buf_utf16_len = 0;
+            }
+        }
+    }
+    // Remaining content
+    if start < content.len() {
+        buf.push_str(&content[start..]);
+    }
+    if !buf.is_empty() {
+        segments.push(buf);
+    }
+
+    // Phase 2: cap each segment at piece_size (UTF-16 code units)
+    let mut pieces = Vec::new();
+    for seg in &segments {
+        let mut taken_utf16: usize = 0;
+        let mut piece_start = 0;
+
+        for (i, ch) in seg.char_indices() {
+            taken_utf16 += ch.len_utf16();
+            if taken_utf16 >= piece_size {
+                let end = i + ch.len_utf8();
+                pieces.push(seg[piece_start..end].to_string());
+                piece_start = end;
+                taken_utf16 = 0;
+            }
+        }
+        if piece_start < seg.len() {
+            pieces.push(seg[piece_start..].to_string());
+        }
+    }
+
+    pieces
+}
+
+/// Split binary content into base64-encoded chunks.
+///
+/// Replicates the LiveSync `splitPieces2V2` binary path:
+/// 1. Compute dynamic minimum chunk size from file size
+/// 2. Find delimiter boundaries (null byte, `/` for PDF, `,` for JSON)
+/// 3. Cap each piece at `piece_size` bytes
+pub fn split_binary(content: &[u8], piece_size: usize, filename: &str) -> Vec<String> {
+    if content.is_empty() {
+        return vec![];
+    }
+
+    let delimiter: u8 = if filename.ends_with(".pdf") {
+        b'/'
+    } else if filename.ends_with(".json") {
+        b','
+    } else {
+        0 // null byte
+    };
+
+    let can_be_small = filename.ends_with(".json");
+
+    // Dynamic minimum chunk size based on file size (replicates TS logic)
+    let clamp_min: usize = if can_be_small { 100 } else { 100_000 };
+    let clamp_max: usize = 100_000_000;
+    let clamped_size = content.len().max(clamp_min).min(clamp_max);
+    let mut step = 1u32;
+    let mut w = clamped_size as f64;
+    while w > 10.0 {
+        w /= 12.5;
+        step += 1;
+    }
+    let minimum_chunk_size = 10_usize.pow(step - 1);
+
+    let size = content.len();
+    let mut i = 0;
+    let mut pieces = Vec::new();
+
+    while i < size {
+        let find_start = i + minimum_chunk_size;
+        let default_split_end = (i + piece_size).min(size);
+
+        let split_end = if find_start < size {
+            // Look for delimiter after minimum chunk size
+            let mut found = None;
+            for pos in find_start..default_split_end.min(size) {
+                if content[pos] == delimiter {
+                    found = Some(pos);
+                    break;
+                }
+            }
+            if found.is_none() {
+                // Fallback: look for newline
+                for pos in find_start..default_split_end.min(size) {
+                    if content[pos] == b'\n' {
+                        found = Some(pos);
+                        break;
+                    }
+                }
+            }
+            match found {
+                Some(pos) if pos < default_split_end => pos,
+                _ => default_split_end,
+            }
+        } else {
+            default_split_end
+        };
+
+        pieces.push(BASE64.encode(&content[i..split_end]));
+        i = split_end;
+    }
+
+    pieces
+}
+
+/// Result of disassembling file content into chunks.
+pub struct DisassembleResult {
+    /// Chunk documents to write to CouchDB.
+    pub chunks: Vec<EntryLeaf>,
+    /// Ordered list of chunk IDs (for the parent document's `children` field).
+    pub children: Vec<String>,
+}
+
+/// Split file content into chunks and generate chunk documents.
+///
+/// This is the write-path counterpart of `reassemble()`.
+///
+/// Text files produce raw text chunks; binary files produce base64 chunks.
+/// If E2EE is enabled, each chunk's data is encrypted before storage.
+/// The returned `children` list contains the chunk IDs in order.
+pub fn disassemble(
+    content: &[u8],
+    filename: &str,
+    piece_size: usize,
+    e2ee: Option<&E2EEContext>,
+) -> anyhow::Result<DisassembleResult> {
+    let passphrase_for_hash = e2ee.map(|ctx| ctx.passphrase.as_str());
+
+    // Text files: raw text pieces; Binary files: base64 pieces
+    let is_text = path::is_plain_text(filename);
+    let pieces = if is_text {
+        let text = std::str::from_utf8(content)
+            .map_err(|e| anyhow::anyhow!("invalid UTF-8 for text file: {e}"))?;
+        split_text(text, piece_size, 250)
+    } else {
+        split_binary(content, piece_size, filename)
+    };
+
+    let mut chunks = Vec::with_capacity(pieces.len());
+    let mut children = Vec::with_capacity(pieces.len());
+    let mut seen_ids: HashMap<String, usize> = HashMap::new();
+
+    for piece in &pieces {
+        let id = chunk_id(piece, passphrase_for_hash);
+
+        children.push(id.clone());
+
+        // Content-addressed dedup: skip if we already created this chunk
+        if seen_ids.contains_key(&id) {
+            continue;
+        }
+        seen_ids.insert(id.clone(), chunks.len());
+
+        // Encrypt chunk data if E2EE is enabled
+        let data = if let Some(ctx) = e2ee {
+            crypto::encrypt_leaf_data_for_write(piece, &ctx.master_key)?
+        } else {
+            piece.clone()
+        };
+
+        chunks.push(EntryLeaf {
+            _id: id,
+            _rev: None,
+            type_: TYPE_LEAF.to_string(),
+            data,
+            is_corrupted: None,
+        });
+    }
+
+    Ok(DisassembleResult { chunks, children })
 }
 
 #[cfg(test)]
@@ -447,5 +821,284 @@ mod tests {
         let note = resolve_note(&raw, Some(&ctx), None).unwrap();
         assert_eq!(note.eden.len(), 1);
         assert_eq!(note.eden.get("h:legacy").unwrap().data, "bGVn");
+    }
+
+    // =====================================================================
+    // Phase 2: chunk_id
+    // =====================================================================
+
+    #[test]
+    fn test_chunk_id_without_passphrase() {
+        let piece = "SGVsbG8="; // base64 "Hello"
+        let id = chunk_id(piece, None);
+        assert!(id.starts_with("h:"));
+        // Deterministic
+        assert_eq!(id, chunk_id(piece, None));
+    }
+
+    #[test]
+    fn test_chunk_id_with_passphrase() {
+        let piece = "SGVsbG8=";
+        let id = chunk_id(piece, Some("my-passphrase"));
+        assert!(id.starts_with("h:"));
+        // Different from without passphrase
+        assert_ne!(id, chunk_id(piece, None));
+    }
+
+    #[test]
+    fn test_chunk_id_different_content_different_id() {
+        let id1 = chunk_id("SGVsbG8=", None);
+        let id2 = chunk_id("V29ybGQ=", None);
+        assert_ne!(id1, id2);
+    }
+
+    #[test]
+    fn test_chunk_id_same_content_same_id() {
+        // Content-addressed: same content → same ID
+        let id1 = chunk_id("SGVsbG8=", Some("pp"));
+        let id2 = chunk_id("SGVsbG8=", Some("pp"));
+        assert_eq!(id1, id2);
+    }
+
+    #[test]
+    fn test_chunk_id_different_passphrase_different_id() {
+        let piece = "SGVsbG8=";
+        let id1 = chunk_id(piece, Some("completely-different-alpha"));
+        let id2 = chunk_id(piece, Some("something-else-entirely-beta"));
+        assert_ne!(id1, id2);
+    }
+
+    // =====================================================================
+    // Phase 2: u64_to_base36
+    // =====================================================================
+
+    #[test]
+    fn test_u64_to_base36_zero() {
+        assert_eq!(u64_to_base36(0), "0");
+    }
+
+    #[test]
+    fn test_u64_to_base36_small() {
+        assert_eq!(u64_to_base36(35), "z");
+        assert_eq!(u64_to_base36(36), "10");
+        assert_eq!(u64_to_base36(255), "73");
+    }
+
+    #[test]
+    fn test_u64_to_base36_matches_js() {
+        // JS: BigInt(1000000).toString(36) === "lfls"
+        assert_eq!(u64_to_base36(1_000_000), "lfls");
+        // JS: BigInt(0xdeadbeef).toString(36) === "1ps9wxb"
+        assert_eq!(u64_to_base36(0xDEAD_BEEF), "1ps9wxb");
+    }
+
+    // =====================================================================
+    // Phase 2: split_text
+    // =====================================================================
+
+    #[test]
+    fn test_split_text_empty() {
+        assert!(split_text("", 1000, 100).is_empty());
+    }
+
+    #[test]
+    fn test_split_text_single_line() {
+        let pieces = split_text("Hello World", 1000, 100);
+        assert_eq!(pieces.len(), 1);
+        // Text chunks are raw text, NOT base64
+        assert_eq!(pieces[0], "Hello World");
+    }
+
+    #[test]
+    fn test_split_text_multiline_under_minimum() {
+        // Lines shorter than minimum → merged into one chunk
+        let text = "line1\nline2\nline3\n";
+        let pieces = split_text(text, 1000, 100);
+        assert_eq!(pieces.len(), 1);
+        assert_eq!(pieces[0], text);
+    }
+
+    #[test]
+    fn test_split_text_multiline_exceeds_minimum() {
+        // Each "line" is 50+ chars; min=40 → should split at newlines
+        let line = "a".repeat(50);
+        let text = format!("{line}\n{line}\n{line}\n");
+        let pieces = split_text(&text, 1000, 40);
+        assert!(pieces.len() > 1, "expected multiple pieces, got {}", pieces.len());
+        // Concatenation should recover original
+        let reconstructed: String = pieces.join("");
+        assert_eq!(reconstructed, text);
+    }
+
+    #[test]
+    fn test_split_text_piece_size_cap() {
+        // Very small piece_size forces splitting even within a segment
+        let text = "Hello World, this is a longer line\n";
+        let pieces = split_text(text, 10, 5);
+        assert!(pieces.len() > 1);
+        let reconstructed: String = pieces.join("");
+        assert_eq!(reconstructed, text);
+    }
+
+    #[test]
+    fn test_split_text_unicode_safe() {
+        // Must not split in the middle of a multi-byte character
+        // piece_size is in UTF-16 code units (matching JS)
+        let text = "한글한글한글한글한글";
+        let pieces = split_text(text, 5, 3);
+        // Each piece must be valid UTF-8
+        for piece in &pieces {
+            assert!(piece.is_ascii() || !piece.is_empty(), "piece should be valid text");
+        }
+        let reconstructed: String = pieces.join("");
+        assert_eq!(reconstructed, text);
+    }
+
+    #[test]
+    fn test_split_text_roundtrip_reassembly() {
+        let text = "# Header\n\nParagraph one with some content.\n\n## Subheader\n\nMore text here.\n";
+        let pieces = split_text(text, 1000, 20);
+        let reconstructed: String = pieces.join("");
+        assert_eq!(reconstructed, text);
+    }
+
+    // =====================================================================
+    // Phase 2: split_binary
+    // =====================================================================
+
+    #[test]
+    fn test_split_binary_empty() {
+        assert!(split_binary(&[], 1000, "test.png").is_empty());
+    }
+
+    #[test]
+    fn test_split_binary_small() {
+        let data = vec![0u8; 50];
+        let pieces = split_binary(&data, 1000, "test.png");
+        assert_eq!(pieces.len(), 1);
+        assert_eq!(BASE64.decode(&pieces[0]).unwrap(), data);
+    }
+
+    #[test]
+    fn test_split_binary_roundtrip() {
+        // Large enough to trigger splitting
+        let data: Vec<u8> = (0..200_000).map(|i| (i % 256) as u8).collect();
+        let pieces = split_binary(&data, 50_000, "test.bin");
+        assert!(pieces.len() > 1);
+        let reconstructed: Vec<u8> = pieces.iter()
+            .flat_map(|p| BASE64.decode(p).unwrap())
+            .collect();
+        assert_eq!(reconstructed, data);
+    }
+
+    #[test]
+    fn test_split_binary_json_small_minimum() {
+        // JSON files allow smaller chunks (min 100 vs 100k for other types)
+        let data = b",item1,item2,item3,item4,";
+        let pieces = split_binary(data, 1000, "data.json");
+        // Roundtrip is what matters
+        let decoded: Vec<u8> = pieces.iter()
+            .flat_map(|p| BASE64.decode(p).unwrap())
+            .collect();
+        assert_eq!(decoded, data);
+    }
+
+    // =====================================================================
+    // Phase 2: disassemble
+    // =====================================================================
+
+    #[test]
+    fn test_disassemble_empty_content() {
+        let result = disassemble(b"", "test.md", 1000, None).unwrap();
+        assert!(result.chunks.is_empty());
+        assert!(result.children.is_empty());
+    }
+
+    #[test]
+    fn test_disassemble_text_basic() {
+        let content = b"# Hello\n\nWorld\n";
+        let result = disassemble(content, "test.md", 1000, None).unwrap();
+        assert!(!result.chunks.is_empty());
+        assert_eq!(result.chunks.len(), result.children.len());
+
+        // All chunk IDs start with "h:"
+        for child in &result.children {
+            assert!(child.starts_with("h:"));
+        }
+
+        // All chunks are leaf type
+        for chunk in &result.chunks {
+            assert_eq!(chunk.type_, "leaf");
+            assert!(chunk._id.starts_with("h:"));
+        }
+
+        // Reassemble: text chunks are raw text, concatenate directly
+        let reconstructed: String = result.children.iter()
+            .map(|id| {
+                let chunk = result.chunks.iter().find(|c| &c._id == id).unwrap();
+                chunk.data.clone()
+            })
+            .collect();
+        assert_eq!(reconstructed, std::str::from_utf8(content).unwrap());
+    }
+
+    #[test]
+    fn test_disassemble_binary() {
+        let content: Vec<u8> = (0..500).map(|i| (i % 256) as u8).collect();
+        let result = disassemble(&content, "image.png", 1000, None).unwrap();
+        assert!(!result.chunks.is_empty());
+
+        let reconstructed: Vec<u8> = result.children.iter()
+            .map(|id| {
+                let chunk = result.chunks.iter().find(|c| &c._id == id).unwrap();
+                BASE64.decode(&chunk.data).unwrap()
+            })
+            .flatten()
+            .collect();
+        assert_eq!(reconstructed, content);
+    }
+
+    #[test]
+    fn test_disassemble_content_dedup() {
+        // Repeated lines → same chunks should be deduped
+        let content = "repeated line\nrepeated line\nrepeated line\n";
+        let result = disassemble(content.as_bytes(), "test.md", 5, None).unwrap();
+        // children may have duplicate IDs, but chunks should be unique
+        let unique_ids: std::collections::HashSet<&str> =
+            result.chunks.iter().map(|c| c._id.as_str()).collect();
+        assert_eq!(unique_ids.len(), result.chunks.len(), "chunks should have unique IDs");
+    }
+
+    #[test]
+    fn test_disassemble_with_e2ee() {
+        let ctx = test_ctx();
+        let content = b"# Secret Note\n\nThis is encrypted.\n";
+        let result = disassemble(content, "secret.md", 1000, Some(&ctx)).unwrap();
+
+        // All chunk data should be encrypted (starts with %=)
+        for chunk in &result.chunks {
+            assert!(chunk.data.starts_with("%="), "chunk data should be encrypted");
+        }
+
+        // Decrypt and reassemble to verify roundtrip
+        // Text chunks: after decryption, data is raw text (not base64)
+        let reconstructed: String = result.children.iter()
+            .map(|id| {
+                let chunk = result.chunks.iter().find(|c| &c._id == id).unwrap();
+                crypto::decrypt_leaf_data(
+                    &chunk.data, &ctx.master_key, &ctx.passphrase,
+                ).unwrap()
+            })
+            .collect();
+        assert_eq!(reconstructed, std::str::from_utf8(content).unwrap());
+    }
+
+    #[test]
+    fn test_disassemble_deterministic_ids() {
+        // Same content + same passphrase → same chunk IDs
+        let content = b"deterministic test";
+        let r1 = disassemble(content, "test.md", 1000, None).unwrap();
+        let r2 = disassemble(content, "test.md", 1000, None).unwrap();
+        assert_eq!(r1.children, r2.children);
     }
 }

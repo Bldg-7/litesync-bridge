@@ -58,6 +58,14 @@ fn decrypt_aes_gcm(key: &[u8; 32], iv: &[u8], ciphertext: &[u8]) -> anyhow::Resu
         .map_err(|e| anyhow::anyhow!("AES-GCM decryption failed: {e}"))
 }
 
+fn encrypt_aes_gcm(key: &[u8; 32], iv: &[u8], plaintext: &[u8]) -> anyhow::Result<Vec<u8>> {
+    let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(key));
+    let nonce = Nonce::from_slice(iv);
+    cipher
+        .encrypt(nonce, plaintext)
+        .map_err(|e| anyhow::anyhow!("AES-GCM encryption failed: {e}"))
+}
+
 // --- Public API ---
 
 /// Decrypt HKDF-encrypted string with a pre-derived master key (prefix `%=`).
@@ -155,6 +163,91 @@ pub fn decrypt_leaf_data(
     passphrase: &str,
 ) -> anyhow::Result<String> {
     decrypt_string(data, master_key, passphrase)
+}
+
+// =========================================================================
+// Phase 2: Encryption (write path)
+// =========================================================================
+
+/// Encrypt plaintext in `%=` format using a pre-derived master key.
+///
+/// Generates random 12-byte IV and 32-byte HKDF salt per call.
+/// Output: `%=` + base64(iv(12) | hkdf_salt(32) | ciphertext+tag)
+pub fn encrypt_hkdf(plaintext: &str, master_key: &[u8; 32]) -> anyhow::Result<String> {
+    let mut iv = [0u8; IV_LENGTH];
+    let mut hkdf_salt = [0u8; HKDF_SALT_LENGTH];
+    getrandom::getrandom(&mut iv).map_err(|e| anyhow::anyhow!("RNG failed: {e}"))?;
+    getrandom::getrandom(&mut hkdf_salt).map_err(|e| anyhow::anyhow!("RNG failed: {e}"))?;
+
+    let chunk_key = derive_chunk_key(master_key, &hkdf_salt)?;
+    let ciphertext = encrypt_aes_gcm(&chunk_key, &iv, plaintext.as_bytes())?;
+
+    let mut binary = Vec::with_capacity(IV_LENGTH + HKDF_SALT_LENGTH + ciphertext.len());
+    binary.extend_from_slice(&iv);
+    binary.extend_from_slice(&hkdf_salt);
+    binary.extend_from_slice(&ciphertext);
+
+    Ok(format!("{}{}", HKDF_ENCRYPTED_PREFIX, BASE64.encode(&binary)))
+}
+
+/// Encrypt note metadata and prepend the `/\:` prefix.
+///
+/// When E2EE is enabled, the path field stores encrypted JSON of
+/// `{path, mtime, ctime, size, children}`. After encryption, the original
+/// metadata fields on the parent document are zeroed.
+pub fn encrypt_meta(
+    path: &str,
+    mtime: u64,
+    ctime: u64,
+    size: u64,
+    children: &[String],
+    master_key: &[u8; 32],
+) -> anyhow::Result<String> {
+    let meta = serde_json::json!({
+        "path": path,
+        "mtime": mtime,
+        "ctime": ctime,
+        "size": size,
+        "children": children,
+    });
+    let json_str = serde_json::to_string(&meta)?;
+    let encrypted = encrypt_hkdf(&json_str, master_key)?;
+    Ok(format!("{}{}", ENCRYPTED_META_PREFIX, encrypted))
+}
+
+/// Encrypt chunk data (EntryLeaf.data field) for writing.
+pub fn encrypt_leaf_data_for_write(
+    data: &str,
+    master_key: &[u8; 32],
+) -> anyhow::Result<String> {
+    encrypt_hkdf(data, master_key)
+}
+
+/// Encrypt the entire eden object as a single JSON blob under a sentinel key.
+///
+/// Returns an eden map containing only the sentinel entry.
+pub fn encrypt_eden(
+    eden: &std::collections::HashMap<String, crate::doc::EdenChunk>,
+    master_key: &[u8; 32],
+) -> anyhow::Result<std::collections::HashMap<String, crate::doc::EdenChunk>> {
+    use crate::doc::{EdenChunk, EDEN_ENCRYPTED_KEY_HKDF};
+
+    if eden.is_empty() {
+        return Ok(eden.clone());
+    }
+
+    let json_str = serde_json::to_string(eden)?;
+    let encrypted = encrypt_hkdf(&json_str, master_key)?;
+
+    let mut result = std::collections::HashMap::new();
+    result.insert(
+        EDEN_ENCRYPTED_KEY_HKDF.to_string(),
+        EdenChunk {
+            data: encrypted,
+            epoch: 999999,
+        },
+    );
+    Ok(result)
 }
 
 #[cfg(test)]
@@ -429,5 +522,139 @@ mod tests {
         let corrupted = format!("%={}", BASE64.encode(&bytes));
         let result = decrypt_hkdf(&corrupted, &master_key);
         assert!(result.is_err());
+    }
+
+    // =====================================================================
+    // Phase 2: Encryption (write path)
+    // =====================================================================
+
+    #[test]
+    fn test_encrypt_hkdf_roundtrip() {
+        let master_key = test_master_key();
+        let plaintext = "hello, world!";
+        let encrypted = super::encrypt_hkdf(plaintext, &master_key).unwrap();
+        assert!(encrypted.starts_with("%="));
+        let decrypted = super::decrypt_hkdf(&encrypted, &master_key).unwrap();
+        assert_eq!(decrypted, plaintext);
+    }
+
+    #[test]
+    fn test_encrypt_hkdf_empty_string() {
+        let master_key = test_master_key();
+        let encrypted = super::encrypt_hkdf("", &master_key).unwrap();
+        let decrypted = super::decrypt_hkdf(&encrypted, &master_key).unwrap();
+        assert_eq!(decrypted, "");
+    }
+
+    #[test]
+    fn test_encrypt_hkdf_unicode() {
+        let master_key = test_master_key();
+        let plaintext = "한글 테스트 🔑 日本語";
+        let encrypted = super::encrypt_hkdf(plaintext, &master_key).unwrap();
+        let decrypted = super::decrypt_hkdf(&encrypted, &master_key).unwrap();
+        assert_eq!(decrypted, plaintext);
+    }
+
+    #[test]
+    fn test_encrypt_hkdf_different_each_time() {
+        let master_key = test_master_key();
+        let text = "same plaintext";
+        let enc1 = super::encrypt_hkdf(text, &master_key).unwrap();
+        let enc2 = super::encrypt_hkdf(text, &master_key).unwrap();
+        // Random IV/salt → different ciphertext each time.
+        assert_ne!(enc1, enc2);
+        // Both decrypt to the same plaintext.
+        assert_eq!(super::decrypt_hkdf(&enc1, &master_key).unwrap(), text);
+        assert_eq!(super::decrypt_hkdf(&enc2, &master_key).unwrap(), text);
+    }
+
+    #[test]
+    fn test_encrypt_hkdf_wrong_key_fails() {
+        let master_key = test_master_key();
+        let encrypted = super::encrypt_hkdf("secret", &master_key).unwrap();
+        let wrong_key = [0xFFu8; 32];
+        assert!(super::decrypt_hkdf(&encrypted, &wrong_key).is_err());
+    }
+
+    #[test]
+    fn test_encrypt_meta_roundtrip() {
+        let master_key = test_master_key();
+        let children = vec!["h:abc".to_string(), "h:def".to_string()];
+        let encrypted = super::encrypt_meta(
+            "notes/hello.md", 1000, 900, 42, &children, &master_key,
+        ).unwrap();
+        assert!(encrypted.starts_with("/\\:"));
+        let meta = super::decrypt_meta(&encrypted, &master_key, TEST_PASSPHRASE).unwrap();
+        assert_eq!(meta.path, "notes/hello.md");
+        assert_eq!(meta.mtime, 1000);
+        assert_eq!(meta.ctime, 900);
+        assert_eq!(meta.size, 42);
+        assert_eq!(meta.children, children);
+    }
+
+    #[test]
+    fn test_encrypt_meta_empty_children() {
+        let master_key = test_master_key();
+        let encrypted = super::encrypt_meta(
+            "test.md", 0, 0, 0, &[], &master_key,
+        ).unwrap();
+        let meta = super::decrypt_meta(&encrypted, &master_key, TEST_PASSPHRASE).unwrap();
+        assert_eq!(meta.path, "test.md");
+        assert!(meta.children.is_empty());
+    }
+
+    #[test]
+    fn test_encrypt_meta_unicode_path() {
+        let master_key = test_master_key();
+        let encrypted = super::encrypt_meta(
+            "노트/한글문서.md", 100, 100, 50, &[], &master_key,
+        ).unwrap();
+        let meta = super::decrypt_meta(&encrypted, &master_key, TEST_PASSPHRASE).unwrap();
+        assert_eq!(meta.path, "노트/한글문서.md");
+    }
+
+    #[test]
+    fn test_encrypt_leaf_data_roundtrip() {
+        let master_key = test_master_key();
+        let data = "SGVsbG8gV29ybGQ="; // base64 of "Hello World"
+        let encrypted = super::encrypt_leaf_data_for_write(data, &master_key).unwrap();
+        assert!(encrypted.starts_with("%="));
+        let decrypted = super::decrypt_leaf_data(&encrypted, &master_key, TEST_PASSPHRASE).unwrap();
+        assert_eq!(decrypted, data);
+    }
+
+    #[test]
+    fn test_encrypt_eden_roundtrip() {
+        use std::collections::HashMap;
+        use crate::doc::{EdenChunk, EDEN_ENCRYPTED_KEY_HKDF};
+
+        let master_key = test_master_key();
+        let mut eden = HashMap::new();
+        eden.insert("h:chunk1".to_string(), EdenChunk { data: "Y2h1bms=".into(), epoch: 1 });
+        eden.insert("h:chunk2".to_string(), EdenChunk { data: "ZGF0YQ==".into(), epoch: 2 });
+
+        let encrypted_eden = super::encrypt_eden(&eden, &master_key).unwrap();
+        assert_eq!(encrypted_eden.len(), 1);
+        assert!(encrypted_eden.contains_key(EDEN_ENCRYPTED_KEY_HKDF));
+
+        let sentinel = &encrypted_eden[EDEN_ENCRYPTED_KEY_HKDF];
+        assert!(sentinel.data.starts_with("%="));
+        assert_eq!(sentinel.epoch, 999999);
+
+        // Decrypt and verify.
+        let json_str = super::decrypt_string(&sentinel.data, &master_key, TEST_PASSPHRASE).unwrap();
+        let restored: HashMap<String, EdenChunk> = serde_json::from_str(&json_str).unwrap();
+        assert_eq!(restored.len(), 2);
+        assert_eq!(restored["h:chunk1"].data, "Y2h1bms=");
+        assert_eq!(restored["h:chunk2"].epoch, 2);
+    }
+
+    #[test]
+    fn test_encrypt_eden_empty_passthrough() {
+        use std::collections::HashMap;
+        let eden: HashMap<String, crate::doc::EdenChunk> = HashMap::new();
+        let master_key = test_master_key();
+        let result = super::encrypt_eden(&eden, &master_key).unwrap();
+        assert!(result.is_empty());
     }
 }
