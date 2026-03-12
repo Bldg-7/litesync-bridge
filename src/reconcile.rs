@@ -24,16 +24,13 @@ const MTIME_TOLERANCE_MS: u64 = 1000;
 
 #[derive(Debug, Clone)]
 pub struct RemoteEntry {
-    pub rel_path: String,
     pub doc_id: String,
     pub mtime: u64,
-    pub size: u64,
     pub deleted: bool,
 }
 
 #[derive(Debug, Clone)]
 pub struct LocalEntry {
-    pub rel_path: String,
     pub mtime: u64,
     pub size: u64,
 }
@@ -241,7 +238,6 @@ fn scan_dir_recursive(
             map.insert(
                 rel_str.to_string(),
                 LocalEntry {
-                    rel_path: rel_str.to_string(),
                     mtime,
                     size,
                 },
@@ -276,12 +272,10 @@ pub async fn fetch_remote_entries(
                 resolve_deleted_path_static(&change.id, change.doc.as_ref(), e2ee, base_dir_prefix)
             {
                 map.insert(
-                    rel_path.clone(),
+                    rel_path,
                     RemoteEntry {
-                        rel_path,
                         doc_id: change.id.clone(),
                         mtime: 0,
-                        size: 0,
                         deleted: true,
                     },
                 );
@@ -322,12 +316,10 @@ pub async fn fetch_remote_entries(
         }
 
         map.insert(
-            rel_path.clone(),
+            rel_path,
             RemoteEntry {
-                rel_path,
                 doc_id: change.id.clone(),
                 mtime: note.mtime,
-                size: note.size,
                 deleted: note.deleted,
             },
         );
@@ -673,6 +665,11 @@ pub enum InitializedPeer {
     Storage {
         peer: StoragePeer,
         config: crate::config::StoragePeerConfig,
+        /// In-memory stat cache populated during reconciliation.
+        /// When present, hub uses this instead of reloading from disk,
+        /// preserving updates from successful operations even when
+        /// reconciliation had errors (which skip the disk save).
+        stat_cache: Option<StatCache>,
     },
 }
 
@@ -690,6 +687,7 @@ impl InitializedPeer {
             InitializedPeer::Storage { peer, .. } => peer.group(),
         }
     }
+
 }
 
 /// Reconcile all CouchDB↔Storage peer pairs in the same group.
@@ -784,13 +782,24 @@ pub async fn reconcile_all(
         )
         .await;
 
-        if let Err(e) = result {
-            tracing::error!(
-                group = %group,
-                storage = %storage_name,
-                "reconciliation failed: {e}"
-            );
-            had_errors = true;
+        match result {
+            Ok(_) => {
+                // Store the in-memory stat cache back into the InitializedPeer
+                // so hub can use it instead of reloading from disk. This
+                // preserves updates from successful operations even when
+                // reconciliation had errors (which skip the disk save).
+                if let InitializedPeer::Storage { stat_cache: ref mut sc, .. } = peers[storage_idx] {
+                    *sc = Some(stat_cache);
+                }
+            }
+            Err(e) => {
+                tracing::error!(
+                    group = %group,
+                    storage = %storage_name,
+                    "reconciliation failed: {e}"
+                );
+                had_errors = true;
+            }
         }
     }
 
@@ -814,14 +823,12 @@ mod tests {
         StatCache::load(Path::new("/tmp/nonexistent"), "test")
     }
 
-    fn remote(rel_path: &str, mtime: u64, size: u64) -> (String, RemoteEntry) {
+    fn remote(rel_path: &str, mtime: u64, _size: u64) -> (String, RemoteEntry) {
         (
             rel_path.to_string(),
             RemoteEntry {
-                rel_path: rel_path.to_string(),
                 doc_id: format!("doc:{rel_path}"),
                 mtime,
-                size,
                 deleted: false,
             },
         )
@@ -831,10 +838,8 @@ mod tests {
         (
             rel_path.to_string(),
             RemoteEntry {
-                rel_path: rel_path.to_string(),
                 doc_id: format!("doc:{rel_path}"),
                 mtime: 0,
-                size: 0,
                 deleted: true,
             },
         )
@@ -844,7 +849,6 @@ mod tests {
         (
             rel_path.to_string(),
             LocalEntry {
-                rel_path: rel_path.to_string(),
                 mtime,
                 size,
             },

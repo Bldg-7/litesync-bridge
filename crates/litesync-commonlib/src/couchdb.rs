@@ -36,6 +36,9 @@ pub struct RemoteTweaks {
     /// Default is `false` (case-insensitive), matching the TS plugin default.
     /// When `false`, paths are lowercased before generating document IDs.
     pub handle_filename_case_sensitive: bool,
+    /// Chunk splitter version: `""` or `"v2"` for legacy newline-based,
+    /// `"v3-rabin-karp"` for Rabin-Karp content-defined chunking.
+    pub chunk_splitter_version: String,
 }
 
 impl Default for RemoteTweaks {
@@ -47,6 +50,7 @@ impl Default for RemoteTweaks {
             enable_chunk_splitter_v2: true,
             use_eden: false,
             handle_filename_case_sensitive: false,
+            chunk_splitter_version: String::new(),
         }
     }
 }
@@ -381,6 +385,12 @@ impl CouchDBClient {
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
 
+        let chunk_splitter_version = tweaks
+            .get("chunkSplitterVersion")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+
         let result = RemoteTweaks {
             custom_chunk_size,
             minimum_chunk_size,
@@ -388,6 +398,7 @@ impl CouchDBClient {
             enable_chunk_splitter_v2,
             use_eden,
             handle_filename_case_sensitive,
+            chunk_splitter_version,
         };
 
         tracing::info!(
@@ -395,6 +406,7 @@ impl CouchDBClient {
             min_chunk_size = result.minimum_chunk_size,
             hash_alg = %result.hash_alg,
             chunk_splitter_v2 = result.enable_chunk_splitter_v2,
+            chunk_splitter_version = %result.chunk_splitter_version,
             use_eden = result.use_eden,
             case_sensitive = result.handle_filename_case_sensitive,
             "fetched remote tweaks"
@@ -604,6 +616,7 @@ mod tests {
             enable_chunk_splitter_v2: enable_v2,
             use_eden,
             handle_filename_case_sensitive: case_sensitive,
+            chunk_splitter_version: String::new(),
         };
         assert_eq!(tweaks.piece_size(), 102_400 * 51);
     }
@@ -649,6 +662,7 @@ mod tests {
             enable_chunk_splitter_v2: enable_v2,
             use_eden,
             handle_filename_case_sensitive: case_sensitive,
+            chunk_splitter_version: String::new(),
         };
         assert_eq!(tweaks.piece_size(), 102_400 * 11);
     }

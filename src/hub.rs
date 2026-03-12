@@ -46,6 +46,7 @@ impl Hub {
                     initialized.push(InitializedPeer::Storage {
                         peer,
                         config,
+                        stat_cache: None,
                     });
                 }
             }
@@ -61,10 +62,15 @@ impl Hub {
         }
 
         // ── Phase 2.5: Inject stat caches into StoragePeers ─────────────
-        for init_peer in &initialized {
-            if let InitializedPeer::Storage { peer, config } = init_peer {
-                let stat_cache = StatCache::load(&data_dir, &config.name);
-                peer.set_stat_cache(stat_cache);
+        // Use the in-memory stat cache from reconciliation when available.
+        // This preserves updates from successful operations even when
+        // reconciliation had errors (which intentionally skip disk save).
+        // Falls back to loading from disk for peers that weren't reconciled.
+        for init_peer in &mut initialized {
+            if let InitializedPeer::Storage { peer, config, stat_cache } = init_peer {
+                let cache = stat_cache.take()
+                    .unwrap_or_else(|| StatCache::load(&data_dir, &config.name));
+                peer.set_stat_cache(cache);
             }
         }
 

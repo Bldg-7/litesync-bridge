@@ -259,7 +259,7 @@ impl StoragePeer {
 
         Ok(Some(ChangeEvent::Modified {
             path: rel_path.to_path_buf(),
-            data,
+            data: Arc::new(data),
             mtime,
             ctime,
             is_binary,
@@ -307,7 +307,7 @@ impl StoragePeer {
                 // Record before writing so the watcher can skip the echo
                 self.write_tracker.record(full.clone());
 
-                tokio::fs::write(&full, &data).await?;
+                tokio::fs::write(&full, &*data).await?;
 
                 // Restore original mtime — this fires a second notify event,
                 // so refresh the tracker timestamp afterward.

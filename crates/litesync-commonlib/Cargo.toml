@@ -25,10 +25,7 @@ hmac = "0.12"
 
 # Hashing
 xxhash-rust = { version = "0.8", features = ["xxh32", "xxh64"] }
-
-# Compression
-flate2 = "1"
-
+sha-1 = "0.10"
 # Binary / String
 base64 = "0.22"
 hex = "0.4"

@@ -6,7 +6,7 @@ use std::sync::Arc;
 pub enum ChangeEvent {
     Modified {
         path: PathBuf,
-        data: Vec<u8>,
+        data: Arc<Vec<u8>>,
         mtime: u64,
         ctime: u64,
         is_binary: bool,

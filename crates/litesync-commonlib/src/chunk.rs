@@ -1,5 +1,6 @@
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
+use sha1::{Sha1, Digest};
 
 use crate::couchdb::CouchDBClient;
 use crate::crypto;
@@ -215,20 +216,60 @@ const EPOCH_FNV1A: u32 = 2_166_136_261;
 const MURMUR_C1: u32 = 0xcc9e_2d51;
 const MURMUR_C2: u32 = 0x1b87_3593;
 const MURMUR_N: u32 = 0xe654_6b64;
+const SEED_MURMURHASH: u32 = 0x1234_5678;
 
 /// Replicate JS `Math.imul(a, b)` — 32-bit truncating multiply.
 fn imul(a: u32, b: u32) -> u32 {
     a.wrapping_mul(b)
 }
 
+/// Convert an f64 to i32 using JavaScript's ToInt32 semantics.
+///
+/// JS bitwise operators (^, <<, >>, >>>, |, &) convert their operands to
+/// signed 32-bit integers via the ECMAScript ToInt32 abstract operation:
+///   1. If the value is NaN, +0, -0, +Inf, or -Inf, return +0.
+///   2. n = sign(x) * floor(|x|)
+///   3. int32bit = n modulo 2^32
+///   4. If int32bit >= 2^31, return int32bit - 2^32; else return int32bit
+fn js_to_int32(value: f64) -> i32 {
+    if value.is_nan() || value.is_infinite() || value == 0.0 {
+        return 0;
+    }
+    // Truncate toward zero (JS: sign(x) * floor(|x|))
+    let n = value.signum() * value.abs().floor();
+    // Modulo 2^32 — wrapping to u32 range
+    let n = n % 4_294_967_296.0; // 2^32
+    let n = if n < 0.0 { n + 4_294_967_296.0 } else { n };
+    // Convert to signed i32
+    if n >= 2_147_483_648.0 {
+        (n - 4_294_967_296.0) as i32
+    } else {
+        n as i32
+    }
+}
+
 /// Replicate the TS `mixedHash(str, seed, fnv1aHash)` function.
 ///
 /// Processes each UTF-16 code unit of the input string through both
 /// MurmurHash3 and FNV-1a, matching the JS `.charCodeAt(i)` semantics.
+///
+/// IMPORTANT: The JS implementation uses regular float64 multiplication for
+/// `k1 *= c1` and `k1 *= c2` (NOT `Math.imul`). When the product exceeds
+/// 2^53 (float64 precision limit), low-order bits are lost. This function
+/// replicates that lossy behavior exactly by performing the same operations
+/// in f64 and converting back to i32 via JS ToInt32 semantics.
 fn mixed_hash(input: &str, seed: u32, fnv1a_init: u32) -> (u32, u32) {
-    let mut h1 = seed;
-    let mut fnv = fnv1a_init;
+    // h1 tracks the MurmurHash3 state as a JS Number (f64).
+    // In JS, h1 starts as the seed integer and flows through arithmetic
+    // and bitwise operations. Bitwise ops (^, <<, >>>) produce int32 values,
+    // while `h1 * 5 + n` produces a float that may exceed 2^32.
+    // We use f64 to match this exactly.
+    let mut h1: f64 = seed as f64;
+    let mut fnv: u32 = fnv1a_init;
     let mut len: u32 = 0;
+
+    let c1_f = MURMUR_C1 as f64;
+    let c2_f = MURMUR_C2 as f64;
 
     // JS iterates by UTF-16 code units via str.charCodeAt(i)
     for ch in input.chars() {
@@ -237,31 +278,39 @@ fn mixed_hash(input: &str, seed: u32, fnv1a_init: u32) -> (u32, u32) {
         for &mut cu in code_units {
             let k1_init = cu as u32;
 
-            // FNV-1a
+            // FNV-1a (uses Math.imul + >>> 0, so exact 32-bit)
             fnv ^= k1_init;
             fnv = imul(fnv, 0x0100_0193);
 
-            // MurmurHash3 inner loop
-            let mut k1 = imul(k1_init, MURMUR_C1);
-            k1 = k1.rotate_left(15);
-            k1 = imul(k1, MURMUR_C2);
-            h1 ^= k1;
-            h1 = h1.rotate_left(13);
-            h1 = h1.wrapping_mul(5).wrapping_add(MURMUR_N);
+            // MurmurHash3 inner loop — uses JS float multiply (NOT Math.imul)
+            // JS: k1 *= c1 (float64 multiply, exact for charCode * c1 < 2^48)
+            let k1_f: f64 = (k1_init as f64) * c1_f;
+            // JS: k1 = (k1 << 15) | (k1 >>> 17) — converts to int32, then rotates
+            let k1_i32 = js_to_int32(k1_f);
+            let k1_u32 = (k1_i32 as u32).rotate_left(15);
+            // JS: k1 *= c2 (float64 multiply, product can exceed 2^53)
+            let k1_f2: f64 = (k1_u32 as i32 as f64) * c2_f;
+            // JS: h1 ^= k1 (both converted to int32 by XOR)
+            let h1_i32 = js_to_int32(h1) ^ js_to_int32(k1_f2);
+            // JS: h1 = (h1 << 13) | (h1 >>> 19)
+            let h1_u32 = (h1_i32 as u32).rotate_left(13);
+            // JS: h1 = h1 * 5 + n (float64 arithmetic, result may exceed 2^32)
+            h1 = (h1_u32 as i32 as f64) * 5.0 + (MURMUR_N as f64);
 
             len += 1;
         }
     }
 
-    // MurmurHash3 finalization
-    h1 ^= len;
-    h1 ^= h1 >> 16;
-    h1 = imul(h1, 0x85eb_ca6b);
-    h1 ^= h1 >> 13;
-    h1 = imul(h1, 0xc2b2_ae35);
-    h1 ^= h1 >> 16;
+    // MurmurHash3 finalization (uses Math.imul, so exact 32-bit)
+    let mut h1_u = js_to_int32(h1) as u32;
+    h1_u ^= len;
+    h1_u ^= h1_u >> 16;
+    h1_u = imul(h1_u, 0x85eb_ca6b);
+    h1_u ^= h1_u >> 13;
+    h1_u = imul(h1_u, 0xc2b2_ae35);
+    h1_u ^= h1_u >> 16;
 
-    (h1, fnv)
+    (h1_u, fnv)
 }
 
 /// Replicate the TS `fallbackMixedHashEach(src)` function.
@@ -298,13 +347,12 @@ fn i32_to_base36(n: i32) -> String {
     }
 }
 
-/// Compute the hashed passphrase for chunk ID generation.
+/// Compute the salted passphrase for hash operations.
 ///
 /// Replicates `HashManagerCore.applyOptions` from the TS LiveSync plugin:
 /// 1. Truncate passphrase to 75% length (UTF-16 code units)
 /// 2. Prepend `SALT_OF_ID`
-/// 3. Hash with MurmurHash3 + FNV-1a (`fallbackMixedHashEach`)
-fn hash_passphrase_for_chunks(passphrase: &str) -> String {
+fn salted_passphrase(passphrase: &str) -> String {
     let total_utf16_len: usize = passphrase.chars().map(|c| c.len_utf16()).sum();
     let using_letters = (total_utf16_len / 4) * 3;
 
@@ -321,24 +369,64 @@ fn hash_passphrase_for_chunks(passphrase: &str) -> String {
         })
         .collect();
 
-    let salted = format!("{}{}", SALT_OF_ID, truncated);
-    fallback_mixed_hash_each(&salted)
+    format!("{}{}", SALT_OF_ID, truncated)
+}
+
+/// Compute the hashed passphrase string for xxhash64 chunk ID generation.
+///
+/// Returns `fallbackMixedHashEach(SALT_OF_ID + passphrase[0..75%])` —
+/// the MurmurHash3+FNV-1a concatenation in base-36, matching the TS
+/// `HashManagerCore.hashedPassphrase` field.
+fn hash_passphrase_for_chunks(passphrase: &str) -> String {
+    fallback_mixed_hash_each(&salted_passphrase(passphrase))
+}
+
+/// Compute the 32-bit hashed passphrase for xxhash32 chunk ID generation.
+///
+/// Returns `mixedHash(SALT_OF_ID + passphrase[0..75%], SEED_MURMURHASH)[0]` —
+/// the MurmurHash3 result with seed `0x12345678`, matching the TS
+/// `HashManagerCore.hashedPassphrase32` field.
+fn hash_passphrase32_for_chunks(passphrase: &str) -> u32 {
+    mixed_hash(&salted_passphrase(passphrase), SEED_MURMURHASH, EPOCH_FNV1A).0
 }
 
 /// Compute a content-addressed chunk ID.
 ///
-/// Supports two algorithms selected by `hash_alg`:
+/// Supports three algorithms selected by `hash_alg`:
 ///
 /// ## xxhash32 (legacy) — `hash_alg == ""` or `hash_alg == "xxhash32"`
 ///
 /// Replicates the LiveSync `XXHash32RawHashManager.computeHash` XOR algorithm:
-/// - With passphrase: `(h32(piece_bytes) ^ hashedPassphrase32 ^ piece.length) as i32` in base-36
-/// - Without passphrase: `(h32(piece_bytes) ^ piece.length) as i32` in base-36
+/// - With passphrase: `(h32Raw(encode(piece)) ^ hashedPassphrase32 ^ piece.length) as i32` in base-36
+/// - Without passphrase: `(h32Raw(encode(piece)) ^ piece.length) as i32` in base-36
 ///
-/// Where `hashedPassphrase32` is `xxh32(fallbackMixedHashEach(SALT_OF_ID + passphrase[0..75%]))`.
-/// The `piece.length` uses JavaScript's UTF-16 code unit count.
+/// Where `hashedPassphrase32` is `mixedHash(SALT_OF_ID + passphrase[0..75%], 0x12345678)[0]`,
+/// i.e. the MurmurHash3 output with seed `SEED_MURMURHASH`.
+///
+/// Note: `h32Raw` takes UTF-8 bytes (`new TextEncoder().encode(piece)`), and
+/// `piece.length` uses JavaScript's UTF-16 code unit count.
 /// The XOR result is cast to `i32` (matching JS bitwise `^` signed semantics) before
 /// base-36 conversion, so negative values produce a `"-"` prefix.
+///
+/// ## mixed-purejs — `hash_alg == "mixed-purejs"`
+///
+/// Replicates the LiveSync `PureJSHashManager.computeHash` algorithm:
+/// - With passphrase: `fallbackMixedHashEach(piece + hashedPassphrase + piece.utf16_len)` (no separators)
+/// - Without passphrase: `fallbackMixedHashEach(piece + "-" + piece.utf16_len)` (dash separator)
+///
+/// Where `hashedPassphrase` is `fallbackMixedHashEach(SALT_OF_ID + passphrase[0..75%])`,
+/// the MurmurHash3+FNV-1a concatenation in base-36.
+///
+/// ## sha1 — `hash_alg == "sha1"`
+///
+/// Replicates the LiveSync `SHA1HashManager.computeHash` algorithm:
+/// - With passphrase: `base64(SHA-1(UTF-8("{piece}-{hashedPassphrase}-{piece.utf16_len}")))`
+/// - Without passphrase: `base64(SHA-1(UTF-8("{piece}-{piece.utf16_len}")))`
+///
+/// Where `hashedPassphrase` is `fallbackMixedHashEach(SALT_OF_ID + passphrase[0..75%])`,
+/// and the result is the full base64 of the 20-byte SHA-1 digest (standard base64,
+/// not url-safe). The input string is encoded as UTF-8 bytes before hashing,
+/// matching the `writeString` function in octagonal-wheels.
 ///
 /// ## xxhash64 — `hash_alg == "xxhash64"` (or any other non-legacy value)
 ///
@@ -346,7 +434,8 @@ fn hash_passphrase_for_chunks(passphrase: &str) -> String {
 /// - With passphrase: `h64("{piece}-{hashedPassphrase}-{piece.utf16_len}")` in base-36
 /// - Without passphrase: `h64("{piece}-{piece.utf16_len}")` in base-36
 ///
-/// Where `hashedPassphrase` is MurmurHash3+FNV-1a of `SALT_OF_ID + passphrase[0..75%]`.
+/// Where `hashedPassphrase` is `fallbackMixedHashEach(SALT_OF_ID + passphrase[0..75%])`,
+/// the MurmurHash3+FNV-1a concatenation in base-36.
 ///
 /// The returned ID uses the `h:+` prefix when E2EE is enabled (passphrase provided),
 /// or the `h:` prefix otherwise, matching the TS plugin's `HashManagerCore.computeHash`
@@ -362,13 +451,13 @@ pub fn chunk_id(piece: &str, passphrase: Option<&str>, hash_alg: &str) -> String
 
     if hash_alg.is_empty() || hash_alg == "xxhash32" {
         // Legacy xxhash32 XOR algorithm (XXHash32RawHashManager)
+        // h32Raw takes UTF-8 bytes: new TextEncoder().encode(piece)
         let piece_bytes = piece.as_bytes();
         let piece_hash = xxhash_rust::xxh32::xxh32(piece_bytes, 0);
 
         let hash = if let Some(pp) = passphrase {
-            let hashed_pp = hash_passphrase_for_chunks(pp);
-            let hashed_pp_bytes = hashed_pp.as_bytes();
-            let hashed_pp32 = xxhash_rust::xxh32::xxh32(hashed_pp_bytes, 0);
+            // TS: hashedPassphrase32 = mixedHash(passphraseForHash, SEED_MURMURHASH)[0]
+            let hashed_pp32 = hash_passphrase32_for_chunks(pp);
             piece_hash ^ hashed_pp32 ^ (piece_utf16_len as u32)
         } else {
             piece_hash ^ (piece_utf16_len as u32)
@@ -376,6 +465,39 @@ pub fn chunk_id(piece: &str, passphrase: Option<&str>, hash_alg: &str) -> String
 
         // JS bitwise XOR returns signed 32-bit; .toString(36) respects sign
         format!("{}{}", prefix, i32_to_base36(hash as i32))
+    } else if hash_alg == "mixed-purejs" {
+        // PureJSHashManager: MurmurHash3 + FNV-1a via fallbackMixedHashEach
+        //
+        // With encryption:    fallbackMixedHashEach(piece + hashedPassphrase + piece.length)
+        //                     — NO separators between components
+        // Without encryption: fallbackMixedHashEach(piece + "-" + piece.length)
+        //                     — dash separator before length
+        //
+        // piece.length is the UTF-16 code unit count (matching JS string.length).
+        let hash_input = if let Some(pp) = passphrase {
+            let hashed_pp = hash_passphrase_for_chunks(pp);
+            format!("{}{}{}", piece, hashed_pp, piece_utf16_len)
+        } else {
+            format!("{}-{}", piece, piece_utf16_len)
+        };
+        format!("{}{}", prefix, fallback_mixed_hash_each(&hash_input))
+    } else if hash_alg == "sha1" {
+        // SHA1HashManager: SHA-1 of UTF-8 encoded string, base64 result
+        //
+        // With encryption:    sha1(piece + "-" + hashedPassphrase + "-" + piece.length)
+        // Without encryption: sha1(piece + "-" + piece.length)
+        //
+        // Where sha1(src) = base64(SHA-1(writeString(src))) and writeString encodes
+        // the input as UTF-8 bytes (matching the octagonal-wheels implementation).
+        // piece.length is the UTF-16 code unit count (matching JS string.length).
+        let hash_input = if let Some(pp) = passphrase {
+            let hashed_pp = hash_passphrase_for_chunks(pp);
+            format!("{}-{}-{}", piece, hashed_pp, piece_utf16_len)
+        } else {
+            format!("{}-{}", piece, piece_utf16_len)
+        };
+        let digest = Sha1::digest(hash_input.as_bytes());
+        format!("{}{}", prefix, BASE64.encode(digest))
     } else {
         // xxhash64 string-concat algorithm (XXHash64HashManager)
         let hash_input = if let Some(pp) = passphrase {
@@ -574,6 +696,101 @@ pub fn split_binary(content: &[u8], piece_size: usize, filename: &str) -> Vec<St
     pieces
 }
 
+/// Split data into chunks using the Rabin-Karp content-defined chunking algorithm.
+///
+/// Replicates the LiveSync `splitPiecesRabinKarp` function from the TS plugin.
+/// Uses a rolling hash with a 48-byte sliding window to find chunk boundaries
+/// based on hash modulus matching. Boundary probability is inversely proportional
+/// to average chunk size, producing well-distributed splits.
+///
+/// For text data (`is_text = true`): returns raw UTF-8 string chunks.
+/// For binary data (`is_text = false`): returns base64-encoded chunks.
+///
+/// The algorithm adapts chunk sizes based on input length:
+/// - Text: targets ~20 chunks, min piece 128 bytes
+/// - Binary: targets ~12 chunks, min piece 4096 bytes
+pub fn split_rabin_karp(
+    data: &[u8],
+    piece_size: usize,
+    min_chunk_size: usize,
+    is_text: bool,
+) -> Vec<Vec<u8>> {
+    if data.is_empty() {
+        return vec![];
+    }
+
+    // 1. Adaptive chunk sizing
+    let min_piece_size: usize = if is_text { 128 } else { 4096 };
+    let split_piece_count: usize = if is_text { 20 } else { 12 };
+    let avg_chunk_size = min_piece_size.max(data.len() / split_piece_count);
+    let max_chunk_size = piece_size.min(avg_chunk_size * 5);
+    let min_chunk_size_actual = (avg_chunk_size / 4).max(min_chunk_size).min(max_chunk_size);
+
+    // 2. Rolling hash parameters
+    const PRIME: i32 = 31;
+    const WINDOW_SIZE: usize = 48;
+    let hash_modulus = avg_chunk_size as u32;
+    let boundary_pattern: u32 = 1;
+
+    // Precompute PRIME^(WINDOW_SIZE-1) using wrapping multiply (matches JS Math.imul)
+    let mut p_pow_w: i32 = 1;
+    for _ in 0..WINDOW_SIZE - 1 {
+        p_pow_w = p_pow_w.wrapping_mul(PRIME);
+    }
+
+    // 3. Process byte-by-byte
+    let mut hash: i32 = 0;
+    let mut start: usize = 0;
+    let length = data.len();
+    let mut chunks: Vec<Vec<u8>> = Vec::new();
+
+    for pos in 0..length {
+        let byte = data[pos] as i32;
+
+        // Update rolling hash
+        if pos >= start + WINDOW_SIZE {
+            let old_byte = data[pos - WINDOW_SIZE] as i32;
+            hash = hash.wrapping_sub(old_byte.wrapping_mul(p_pow_w));
+            hash = hash.wrapping_mul(PRIME);
+            hash = hash.wrapping_add(byte);
+        } else {
+            hash = hash.wrapping_mul(PRIME);
+            hash = hash.wrapping_add(byte);
+        }
+
+        let current_chunk_size = pos - start + 1;
+        let mut is_boundary = false;
+
+        // Boundary judgment
+        if current_chunk_size >= min_chunk_size_actual {
+            // JS `(hash >>> 0) % modulus` is unsigned right shift → u32 modulus
+            if hash_modulus > 0 && (hash as u32) % hash_modulus == boundary_pattern {
+                is_boundary = true;
+            }
+        }
+        if current_chunk_size >= max_chunk_size {
+            is_boundary = true;
+        }
+
+        if is_boundary {
+            // UTF-8 safety for text: don't split mid-sequence
+            if is_text && pos + 1 < length && (data[pos + 1] & 0xC0) == 0x80 {
+                continue; // continuation byte — skip this boundary
+            }
+            chunks.push(data[start..=pos].to_vec());
+            start = pos + 1;
+            hash = 0;
+        }
+    }
+
+    // 4. Remaining data
+    if start < length {
+        chunks.push(data[start..].to_vec());
+    }
+
+    chunks
+}
+
 /// Result of disassembling file content into chunks.
 pub struct DisassembleResult {
     /// Chunk documents to write to CouchDB.
@@ -593,6 +810,10 @@ pub struct DisassembleResult {
 /// `min_chunk_size` controls the minimum text chunk size (default: 20 in the
 /// Obsidian plugin). This value is fetched from the remote milestone document's
 /// `minimumChunkSize` tweak.
+///
+/// `chunk_splitter_version` selects the splitting algorithm:
+/// - `"v3-rabin-karp"` — Rabin-Karp content-defined chunking
+/// - `""` or `"v2"` or any other value — legacy newline/delimiter splitting
 pub fn disassemble(
     content: &[u8],
     filename: &str,
@@ -600,6 +821,7 @@ pub fn disassemble(
     min_chunk_size: usize,
     e2ee: Option<&E2EEContext>,
     hash_alg: &str,
+    chunk_splitter_version: &str,
 ) -> anyhow::Result<DisassembleResult> {
     let passphrase_for_hash = e2ee.map(|ctx| ctx.passphrase.as_str());
 
@@ -609,12 +831,35 @@ pub fn disassemble(
     // Within the text path, should_split_as_plain_text (md, txt, canvas) further
     // controls newline-based vs character-based splitting in split_text.
     let is_text = path::is_plain_text(filename);
-    let pieces = if is_text {
-        let text = std::str::from_utf8(content)
-            .map_err(|e| anyhow::anyhow!("invalid UTF-8 for text file: {e}"))?;
-        split_text(text, piece_size, min_chunk_size)
+
+    let pieces = if chunk_splitter_version == "v3-rabin-karp" {
+        // Rabin-Karp content-defined chunking
+        let raw_chunks = split_rabin_karp(content, piece_size, min_chunk_size, is_text);
+        if is_text {
+            // Text: raw UTF-8 string chunks
+            raw_chunks
+                .into_iter()
+                .map(|chunk| {
+                    String::from_utf8(chunk)
+                        .map_err(|e| anyhow::anyhow!("invalid UTF-8 in Rabin-Karp text chunk: {e}"))
+                })
+                .collect::<anyhow::Result<Vec<String>>>()?
+        } else {
+            // Binary: base64-encode each chunk
+            raw_chunks
+                .into_iter()
+                .map(|chunk| BASE64.encode(&chunk))
+                .collect()
+        }
     } else {
-        split_binary(content, piece_size, filename)
+        // Legacy V2 splitting
+        if is_text {
+            let text = std::str::from_utf8(content)
+                .map_err(|e| anyhow::anyhow!("invalid UTF-8 for text file: {e}"))?;
+            split_text(text, piece_size, min_chunk_size)
+        } else {
+            split_binary(content, piece_size, filename)
+        }
     };
 
     let mut chunks = Vec::with_capacity(pieces.len());
@@ -1059,12 +1304,12 @@ mod tests {
     #[test]
     fn test_chunk_id_xxhash32_matches_ts_with_encryption() {
         // Verified against TS XXHash32RawHashManager.computeHashWithEncryption:
-        //   hashedPassphrase = fallbackMixedHashEach(SALT_OF_ID + "my-passphrase"[0..75%])
-        //   hashedPassphrase32 = h32Raw(encode(hashedPassphrase))
-        //   (h32Raw(encode("SGVsbG8=")) ^ hashedPassphrase32 ^ 8).toString(36) === "-grd23m"
+        //   hashedPassphrase32 = mixedHash(SALT_OF_ID + "my-passphrase"[0..75%], 0x12345678)[0]
+        //     = 3461622840 (0xce542c38)
+        //   (h32Raw(encode("SGVsbG8=")) ^ hashedPassphrase32 ^ 8).toString(36) === "emz3ni"
         let piece = "SGVsbG8=";
         let id = chunk_id(piece, Some("my-passphrase"), "xxhash32");
-        assert_eq!(id, "h:+-grd23m");
+        assert_eq!(id, "h:+emz3ni");
     }
 
     #[test]
@@ -1075,6 +1320,138 @@ mod tests {
         let piece = "chunk0";
         let id = chunk_id(piece, None, "xxhash32");
         assert_eq!(id, "h:-upzatc");
+    }
+
+    #[test]
+    fn test_chunk_id_xxhash64_matches_ts_without_encryption() {
+        // Verified against TS XXHash64HashManager.computeHashWithoutEncryption:
+        //   h64("SGVsbG8=-8").toString(36) === "t0zp1re6sarc"
+        let piece = "SGVsbG8=";
+        let id = chunk_id(piece, None, "xxhash64");
+        assert_eq!(id, "h:t0zp1re6sarc");
+    }
+
+    #[test]
+    fn test_chunk_id_xxhash64_matches_ts_with_encryption() {
+        // Verified against TS XXHash64HashManager.computeHashWithEncryption:
+        //   hashedPassphrase = fallbackMixedHashEach(SALT_OF_ID + "my-passphrase"[0..75%])
+        //     = "1uh2dy2p9zmoa"
+        //   h64("SGVsbG8=-1uh2dy2p9zmoa-8").toString(36) === "2539sh0qqsm85"
+        let piece = "SGVsbG8=";
+        let id = chunk_id(piece, Some("my-passphrase"), "xxhash64");
+        assert_eq!(id, "h:+2539sh0qqsm85");
+    }
+
+    #[test]
+    fn test_chunk_id_mixed_purejs_without_encryption() {
+        // PureJSHashManager.computeHashWithoutEncryption:
+        //   fallbackMixedHashEach(piece + "-" + piece.length)
+        // piece = "SGVsbG8=", piece.length = 8 (all ASCII, so UTF-16 len = 8)
+        //   => fallbackMixedHashEach("SGVsbG8=-8")
+        let piece = "SGVsbG8=";
+        let id = chunk_id(piece, None, "mixed-purejs");
+        assert!(id.starts_with("h:"), "plain chunk ID should start with 'h:', got: {id}");
+        assert!(!id.starts_with("h:+"), "plain chunk ID must NOT have '+' discriminator");
+        // Deterministic
+        assert_eq!(id, chunk_id(piece, None, "mixed-purejs"));
+        // Verify against known value: fallbackMixedHashEach("SGVsbG8=-8")
+        let expected_hash = fallback_mixed_hash_each("SGVsbG8=-8");
+        assert_eq!(id, format!("h:{}", expected_hash));
+    }
+
+    #[test]
+    fn test_chunk_id_mixed_purejs_with_encryption() {
+        // PureJSHashManager.computeHashWithEncryption:
+        //   fallbackMixedHashEach(piece + hashedPassphrase + piece.length)
+        //   — NO separators between piece, hashedPassphrase, and piece.length
+        // piece = "SGVsbG8=", passphrase = "my-passphrase"
+        //   hashedPassphrase = fallbackMixedHashEach(SALT_OF_ID + "my-passph") = "1uh2dy2p9zmoa"
+        //   => fallbackMixedHashEach("SGVsbG8=" + "1uh2dy2p9zmoa" + "8")
+        //   => fallbackMixedHashEach("SGVsbG8=1uh2dy2p9zmoa8")
+        let piece = "SGVsbG8=";
+        let id = chunk_id(piece, Some("my-passphrase"), "mixed-purejs");
+        assert!(id.starts_with("h:+"), "E2EE chunk ID should start with 'h:+', got: {id}");
+        // Deterministic
+        assert_eq!(id, chunk_id(piece, Some("my-passphrase"), "mixed-purejs"));
+        // Different from without passphrase
+        assert_ne!(id, chunk_id(piece, None, "mixed-purejs"));
+        // Different from xxhash64 with same inputs
+        assert_ne!(id, chunk_id(piece, Some("my-passphrase"), "xxhash64"));
+        // Verify against known value
+        let hashed_pp = hash_passphrase_for_chunks("my-passphrase");
+        let expected_input = format!("{}{}8", piece, hashed_pp);
+        let expected_hash = fallback_mixed_hash_each(&expected_input);
+        assert_eq!(id, format!("h:+{}", expected_hash));
+    }
+
+    #[test]
+    fn test_chunk_id_sha1_without_encryption() {
+        // SHA1HashManager.computeHashWithoutEncryption:
+        //   sha1(piece + "-" + piece.length)
+        // piece = "SGVsbG8=", piece.length = 8 (all ASCII, UTF-16 len = 8)
+        //   => sha1("SGVsbG8=-8")
+        //   => base64(SHA-1(UTF-8("SGVsbG8=-8"))) = "NZNFqQ5LyRFPC9SklBsWSXWdJP4="
+        // Verified against TS SHA1HashManager running on Node.js.
+        let piece = "SGVsbG8=";
+        let id = chunk_id(piece, None, "sha1");
+        assert_eq!(id, "h:NZNFqQ5LyRFPC9SklBsWSXWdJP4=");
+        // Deterministic
+        assert_eq!(id, chunk_id(piece, None, "sha1"));
+        // Different from other algorithms
+        assert_ne!(id, chunk_id(piece, None, "xxhash64"));
+        assert_ne!(id, chunk_id(piece, None, "mixed-purejs"));
+    }
+
+    #[test]
+    fn test_chunk_id_sha1_with_encryption() {
+        // SHA1HashManager.computeHashWithEncryption:
+        //   sha1(piece + "-" + hashedPassphrase + "-" + piece.length)
+        // piece = "SGVsbG8=", passphrase = "my-passphrase"
+        //   hashedPassphrase = fallbackMixedHashEach(SALT_OF_ID + "my-passph") = "1uh2dy2p9zmoa"
+        //   => sha1("SGVsbG8=-1uh2dy2p9zmoa-8")
+        //   => base64(SHA-1(UTF-8(...))) = "HS6CyMO6Jl4jW6u7OsvQs+gh82g="
+        // Verified against TS SHA1HashManager running on Node.js.
+        let piece = "SGVsbG8=";
+        let id = chunk_id(piece, Some("my-passphrase"), "sha1");
+        assert_eq!(id, "h:+HS6CyMO6Jl4jW6u7OsvQs+gh82g=");
+        // Different from without passphrase
+        assert_ne!(id, chunk_id(piece, None, "sha1"));
+        // Different from other algorithms with same inputs
+        assert_ne!(id, chunk_id(piece, Some("my-passphrase"), "xxhash64"));
+    }
+
+    #[test]
+    fn test_chunk_id_sha1_utf8_encoding() {
+        // Verify that non-ASCII input produces correct UTF-8 bytes before hashing.
+        // piece = "こんにちは" (5 UTF-16 code units, 15 UTF-8 bytes)
+        // piece.length = 5 (JS string.length = UTF-16 code units)
+        //   => sha1("こんにちは-5")
+        //   => base64(SHA-1(UTF-8("こんにちは-5"))) = "4+Lk/750Kv2XUKxmwRae6WOzikM="
+        // Verified against TS SHA1HashManager running on Node.js.
+        let piece = "こんにちは";
+        let id = chunk_id(piece, None, "sha1");
+        assert_eq!(id, "h:4+Lk/750Kv2XUKxmwRae6WOzikM=");
+        // Verify piece.length is UTF-16 code units (5), not byte length (15)
+        let utf16_len: usize = piece.chars().map(|c| c.len_utf16()).sum();
+        assert_eq!(utf16_len, 5);
+    }
+
+    #[test]
+    fn test_mixed_hash_matches_ts() {
+        // Verify mixed_hash matches TS mixedHash including float64 precision behavior.
+        // TS: mixedHash("a83hrf7f\x03y7sa8g31my-passph", 0x12345678)[0] = 3461622840
+        let input = "a83hrf7f\u{0003}y7sa8g31my-passph";
+        let (h1, _fnv) = mixed_hash(input, 0x1234_5678, EPOCH_FNV1A);
+        assert_eq!(h1, 3_461_622_840);
+    }
+
+    #[test]
+    fn test_fallback_mixed_hash_each_matches_ts() {
+        // Verify fallbackMixedHashEach matches TS output.
+        // TS: fallbackMixedHashEach("a83hrf7f\x03y7sa8g31my-passph") = "1uh2dy2p9zmoa"
+        let input = "a83hrf7f\u{0003}y7sa8g31my-passph";
+        let result = fallback_mixed_hash_each(input);
+        assert_eq!(result, "1uh2dy2p9zmoa");
     }
 
     // =====================================================================
@@ -1428,7 +1805,7 @@ mod tests {
 
     #[test]
     fn test_disassemble_empty_content() {
-        let result = disassemble(b"", "test.md", 1000, 20, None, "xxhash64").unwrap();
+        let result = disassemble(b"", "test.md", 1000, 20, None, "xxhash64", "").unwrap();
         assert!(result.chunks.is_empty());
         assert!(result.children.is_empty());
     }
@@ -1436,7 +1813,7 @@ mod tests {
     #[test]
     fn test_disassemble_text_basic() {
         let content = b"# Hello\n\nWorld\n";
-        let result = disassemble(content, "test.md", 1000, 20, None, "xxhash64").unwrap();
+        let result = disassemble(content, "test.md", 1000, 20, None, "xxhash64", "").unwrap();
         assert!(!result.chunks.is_empty());
         assert_eq!(result.chunks.len(), result.children.len());
 
@@ -1466,7 +1843,7 @@ mod tests {
     #[test]
     fn test_disassemble_binary() {
         let content: Vec<u8> = (0..500).map(|i| (i % 256) as u8).collect();
-        let result = disassemble(&content, "image.png", 1000, 20, None, "xxhash64").unwrap();
+        let result = disassemble(&content, "image.png", 1000, 20, None, "xxhash64", "").unwrap();
         assert!(!result.chunks.is_empty());
 
         let reconstructed: Vec<u8> = result.children.iter()
@@ -1483,7 +1860,7 @@ mod tests {
     fn test_disassemble_content_dedup() {
         // Repeated lines → same chunks should be deduped
         let content = "repeated line\nrepeated line\nrepeated line\n";
-        let result = disassemble(content.as_bytes(), "test.md", 5, 20, None, "xxhash64").unwrap();
+        let result = disassemble(content.as_bytes(), "test.md", 5, 20, None, "xxhash64", "").unwrap();
         // children may have duplicate IDs, but chunks should be unique
         let unique_ids: std::collections::HashSet<&str> =
             result.chunks.iter().map(|c| c._id.as_str()).collect();
@@ -1494,7 +1871,7 @@ mod tests {
     fn test_disassemble_with_e2ee() {
         let ctx = test_ctx();
         let content = b"# Secret Note\n\nThis is encrypted.\n";
-        let result = disassemble(content, "secret.md", 1000, 20, Some(&ctx), "xxhash64").unwrap();
+        let result = disassemble(content, "secret.md", 1000, 20, Some(&ctx), "xxhash64", "").unwrap();
 
         // All chunk IDs should use the encrypted prefix "h:+"
         for child in &result.children {
@@ -1524,8 +1901,8 @@ mod tests {
     fn test_disassemble_deterministic_ids() {
         // Same content + same passphrase → same chunk IDs
         let content = b"deterministic test";
-        let r1 = disassemble(content, "test.md", 1000, 20, None, "xxhash64").unwrap();
-        let r2 = disassemble(content, "test.md", 1000, 20, None, "xxhash64").unwrap();
+        let r1 = disassemble(content, "test.md", 1000, 20, None, "xxhash64", "").unwrap();
+        let r2 = disassemble(content, "test.md", 1000, 20, None, "xxhash64", "").unwrap();
         assert_eq!(r1.children, r2.children);
     }
 
@@ -1538,7 +1915,7 @@ mod tests {
 
         for ext in &["css", "js", "html", "svg", "csv", "xml"] {
             let filename = format!("test.{ext}");
-            let result = disassemble(content, &filename, 1000, 20, None, "xxhash64").unwrap();
+            let result = disassemble(content, &filename, 1000, 20, None, "xxhash64", "").unwrap();
             assert!(!result.chunks.is_empty(), "{filename} should produce chunks");
 
             // Text-split chunks are raw text, not base64.
@@ -1564,7 +1941,7 @@ mod tests {
 
         for ext in &["png", "jpg", "zip", "pdf", "woff2"] {
             let filename = format!("test.{ext}");
-            let result = disassemble(content, &filename, 1000, 20, None, "xxhash64").unwrap();
+            let result = disassemble(content, &filename, 1000, 20, None, "xxhash64", "").unwrap();
             assert!(!result.chunks.is_empty(), "{filename} should produce chunks");
 
             // Binary-split chunks are base64-encoded.
@@ -1584,7 +1961,7 @@ mod tests {
 
         for ext in &["md", "txt", "canvas"] {
             let filename = format!("test.{ext}");
-            let result = disassemble(content, &filename, 1000, 20, None, "xxhash64").unwrap();
+            let result = disassemble(content, &filename, 1000, 20, None, "xxhash64", "").unwrap();
             assert!(!result.chunks.is_empty(), "{filename} should produce chunks");
 
             // Text-split chunks are raw text, not base64.
@@ -1601,5 +1978,217 @@ mod tests {
                 "{filename}: text roundtrip failed"
             );
         }
+    }
+
+    // =====================================================================
+    // Phase 5: split_rabin_karp
+    // =====================================================================
+
+    #[test]
+    fn test_split_rabin_karp_empty() {
+        let chunks = split_rabin_karp(b"", 1000, 20, true);
+        assert!(chunks.is_empty());
+        let chunks = split_rabin_karp(b"", 1000, 20, false);
+        assert!(chunks.is_empty());
+    }
+
+    #[test]
+    fn test_split_rabin_karp_small_text_single_chunk() {
+        // File smaller than min_piece_size (128 for text) → single chunk
+        let data = b"Hello, World!";
+        let chunks = split_rabin_karp(data, 100_000, 20, true);
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0], data);
+    }
+
+    #[test]
+    fn test_split_rabin_karp_small_binary_single_chunk() {
+        // File smaller than min_piece_size (4096 for binary) → single chunk
+        let data = vec![0x42u8; 100];
+        let chunks = split_rabin_karp(&data, 100_000, 20, false);
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0], data);
+    }
+
+    #[test]
+    fn test_split_rabin_karp_text_roundtrip() {
+        let text = "# Title\n\nThis is a paragraph with some content that should be long enough to trigger splitting.\n\n## Subtitle\n\nMore content here to pad out the file size and generate multiple chunks from the Rabin-Karp splitter.\n\nAnother paragraph with different text to ensure boundaries vary.\n\nAnd yet another section that keeps going to push us past the minimum piece size threshold of 128 bytes for text files.\n\nThe quick brown fox jumps over the lazy dog. This is repeated text to increase the total data size.\n\nFinal paragraph to close things out with some more words.\n";
+        let data = text.as_bytes();
+        let chunks = split_rabin_karp(data, 100_000, 20, true);
+        assert!(!chunks.is_empty());
+        // Roundtrip: concatenate all chunks
+        let reconstructed: Vec<u8> = chunks.iter().flat_map(|c| c.iter().copied()).collect();
+        assert_eq!(reconstructed, data);
+        // Each chunk must be valid UTF-8
+        for (i, chunk) in chunks.iter().enumerate() {
+            assert!(
+                std::str::from_utf8(chunk).is_ok(),
+                "text chunk {i} is not valid UTF-8"
+            );
+        }
+    }
+
+    #[test]
+    fn test_split_rabin_karp_binary_roundtrip() {
+        // Generate a non-trivial binary blob
+        let data: Vec<u8> = (0..50_000).map(|i| (i % 256) as u8).collect();
+        let chunks = split_rabin_karp(&data, 100_000, 20, false);
+        assert!(!chunks.is_empty());
+        let reconstructed: Vec<u8> = chunks.iter().flat_map(|c| c.iter().copied()).collect();
+        assert_eq!(reconstructed, data);
+    }
+
+    #[test]
+    fn test_split_rabin_karp_utf8_safety() {
+        // Multi-byte UTF-8 characters: must not split mid-sequence
+        // U+1F600 (grinning face) is 4 bytes: F0 9F 98 80
+        // U+00E9 (e with acute) is 2 bytes: C3 A9
+        // U+4E16 (Chinese character) is 3 bytes: E4 B8 96
+        let text = "\u{1F600}".repeat(200) + &"\u{00E9}".repeat(200) + &"\u{4E16}".repeat(200);
+        let data = text.as_bytes();
+        let chunks = split_rabin_karp(data, 100_000, 20, true);
+        // Each chunk must be valid UTF-8
+        for (i, chunk) in chunks.iter().enumerate() {
+            assert!(
+                std::str::from_utf8(chunk).is_ok(),
+                "chunk {i} split mid-UTF-8 sequence"
+            );
+        }
+        // Roundtrip
+        let reconstructed: Vec<u8> = chunks.iter().flat_map(|c| c.iter().copied()).collect();
+        assert_eq!(reconstructed, data);
+    }
+
+    #[test]
+    fn test_split_rabin_karp_deterministic() {
+        let data = b"The same input always produces the same chunks.".repeat(50);
+        let chunks1 = split_rabin_karp(&data, 100_000, 20, true);
+        let chunks2 = split_rabin_karp(&data, 100_000, 20, true);
+        assert_eq!(chunks1, chunks2);
+    }
+
+    #[test]
+    fn test_split_rabin_karp_respects_max_chunk_size() {
+        // With a small piece_size, no chunk should exceed max_chunk_size
+        let data: Vec<u8> = (0..10_000).map(|i| (i % 256) as u8).collect();
+        let piece_size = 500;
+        let chunks = split_rabin_karp(&data, piece_size, 20, false);
+        // max_chunk_size = min(piece_size, avg_chunk_size * 5)
+        // avg_chunk_size = max(4096, 10000/12) = 4096 (binary min_piece_size dominates)
+        // max_chunk_size = min(500, 4096*5) = 500
+        for (i, chunk) in chunks.iter().enumerate() {
+            assert!(
+                chunk.len() <= piece_size,
+                "chunk {i} has length {} > piece_size {}",
+                chunk.len(),
+                piece_size
+            );
+        }
+        // Roundtrip
+        let reconstructed: Vec<u8> = chunks.iter().flat_map(|c| c.iter().copied()).collect();
+        assert_eq!(reconstructed, data);
+    }
+
+    #[test]
+    fn test_split_rabin_karp_large_text_produces_multiple_chunks() {
+        // A large enough text file should produce more than one chunk
+        let text = "Lorem ipsum dolor sit amet. ".repeat(500);
+        let data = text.as_bytes();
+        let chunks = split_rabin_karp(data, 100_000, 20, true);
+        assert!(
+            chunks.len() > 1,
+            "expected multiple chunks for {}B text, got {}",
+            data.len(),
+            chunks.len()
+        );
+    }
+
+    // =====================================================================
+    // Disassemble with v3-rabin-karp
+    // =====================================================================
+
+    #[test]
+    fn test_disassemble_rabin_karp_text() {
+        let content = "# Hello\n\nWorld\n".repeat(50);
+        let result = disassemble(
+            content.as_bytes(), "test.md", 100_000, 20, None, "xxhash64", "v3-rabin-karp",
+        ).unwrap();
+        assert!(!result.chunks.is_empty());
+
+        // Text chunks are raw text; concatenation should recover original
+        let reconstructed: String = result.children.iter()
+            .map(|id| {
+                let chunk = result.chunks.iter().find(|c| &c._id == id).unwrap();
+                chunk.data.clone()
+            })
+            .collect();
+        assert_eq!(reconstructed, content);
+    }
+
+    #[test]
+    fn test_disassemble_rabin_karp_binary() {
+        let content: Vec<u8> = (0..50_000).map(|i| (i % 256) as u8).collect();
+        let result = disassemble(
+            &content, "image.png", 100_000, 20, None, "xxhash64", "v3-rabin-karp",
+        ).unwrap();
+        assert!(!result.chunks.is_empty());
+
+        // Binary chunks are base64-encoded
+        let reconstructed: Vec<u8> = result.children.iter()
+            .map(|id| {
+                let chunk = result.chunks.iter().find(|c| &c._id == id).unwrap();
+                BASE64.decode(&chunk.data).unwrap()
+            })
+            .flatten()
+            .collect();
+        assert_eq!(reconstructed, content);
+    }
+
+    #[test]
+    fn test_disassemble_rabin_karp_empty() {
+        let result = disassemble(
+            b"", "test.md", 1000, 20, None, "xxhash64", "v3-rabin-karp",
+        ).unwrap();
+        assert!(result.chunks.is_empty());
+        assert!(result.children.is_empty());
+    }
+
+    #[test]
+    fn test_disassemble_rabin_karp_with_e2ee() {
+        let ctx = test_ctx();
+        let content = "# Secret Rabin-Karp Note\n\nThis is encrypted and split with RK.\n".repeat(20);
+        let result = disassemble(
+            content.as_bytes(), "secret.md", 100_000, 20, Some(&ctx), "xxhash64", "v3-rabin-karp",
+        ).unwrap();
+
+        // All chunk IDs should use the encrypted prefix "h:+"
+        for child in &result.children {
+            assert!(child.starts_with("h:+"), "E2EE chunk ID should start with 'h:+', got: {child}");
+        }
+
+        // All chunk data should be encrypted (starts with %=)
+        for chunk in &result.chunks {
+            assert!(chunk.data.starts_with("%="), "chunk data should be encrypted");
+        }
+
+        // Decrypt and reassemble to verify roundtrip
+        let reconstructed: String = result.children.iter()
+            .map(|id| {
+                let chunk = result.chunks.iter().find(|c| &c._id == id).unwrap();
+                crypto::decrypt_leaf_data(
+                    &chunk.data, &ctx.master_key, &ctx.passphrase,
+                ).unwrap()
+            })
+            .collect();
+        assert_eq!(reconstructed, content);
+    }
+
+    #[test]
+    fn test_disassemble_rabin_karp_deterministic_ids() {
+        let content = b"deterministic rabin-karp test content that is long enough to split";
+        let content_repeated = content.repeat(20);
+        let r1 = disassemble(&content_repeated, "test.md", 100_000, 20, None, "xxhash64", "v3-rabin-karp").unwrap();
+        let r2 = disassemble(&content_repeated, "test.md", 100_000, 20, None, "xxhash64", "v3-rabin-karp").unwrap();
+        assert_eq!(r1.children, r2.children);
     }
 }

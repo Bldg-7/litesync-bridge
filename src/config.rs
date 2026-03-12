@@ -25,12 +25,6 @@ impl PeerConfig {
         }
     }
 
-    pub fn group(&self) -> &str {
-        match self {
-            PeerConfig::CouchDB(c) => &c.group,
-            PeerConfig::Storage(s) => &s.group,
-        }
-    }
 }
 
 #[derive(Deserialize)]
@@ -72,7 +66,9 @@ pub struct StoragePeerConfig {
     pub name: String,
     pub group: String,
     pub base_dir: PathBuf,
+    /// Reserved for future use; deserialized for backward compatibility.
     #[serde(default)]
+    #[allow(dead_code)]
     pub scan_offline_changes: bool,
 }
 

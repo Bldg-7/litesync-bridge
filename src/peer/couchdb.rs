@@ -380,7 +380,7 @@ impl CouchDBPeer {
 
         Ok(Some(ChangeEvent::Modified {
             path: PathBuf::from(&rel_path),
-            data,
+            data: Arc::new(data),
             mtime: note.mtime,
             ctime: note.ctime,
             is_binary: note.is_binary,

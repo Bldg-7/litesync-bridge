@@ -226,6 +226,7 @@ impl StatCache {
     }
 
     /// Get the stored stat value for a path.
+    #[cfg(test)]
     pub fn get(&self, rel_path: &str) -> Option<&str> {
         self.entries.get(rel_path).map(String::as_str)
     }
@@ -251,6 +252,7 @@ impl StatCache {
     }
 
     /// Check if the cache is empty (first run or reset).
+    #[cfg(test)]
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }

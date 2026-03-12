@@ -120,19 +120,36 @@ pub fn decrypt_with_ephemeral_salt(input: &str, passphrase: &str) -> anyhow::Res
     String::from_utf8(plaintext).map_err(|e| anyhow::anyhow!("invalid UTF-8: {e}"))
 }
 
+/// Error message for unsupported V1/legacy encryption formats.
+const V1_UNSUPPORTED_MSG: &str =
+    "V1 encryption not supported. Run 'Fetch' rebuild in Obsidian plugin to migrate to V2 HKDF";
+
 /// Detect encryption format and decrypt accordingly.
 ///
 /// For `%=` prefix: uses the pre-derived `master_key` (fast path).
 /// For `%$` prefix: derives a new master key from embedded salt (slow path).
+///
+/// Legacy formats (`%~`, bare `%`, JSON array `[`) are explicitly rejected
+/// with an actionable error message (ADR-001).
 pub fn decrypt_string(
     input: &str,
     master_key: &[u8; 32],
     passphrase: &str,
 ) -> anyhow::Result<String> {
+    // V2 HKDF formats (supported)
     if input.starts_with(HKDF_SALTED_ENCRYPTED_PREFIX) {
         decrypt_with_ephemeral_salt(input, passphrase)
     } else if input.starts_with(HKDF_ENCRYPTED_PREFIX) {
         decrypt_hkdf(input, master_key)
+    }
+    // Legacy V1 formats (unsupported — explicit detection per ADR-001)
+    else if input.starts_with("%~") {
+        anyhow::bail!("{V1_UNSUPPORTED_MSG} (detected V3 legacy '%~' prefix)")
+    } else if input.starts_with('%') {
+        // Bare `%` that is NOT `%=` or `%$` or `%~` (already checked above)
+        anyhow::bail!("{V1_UNSUPPORTED_MSG} (detected V2 legacy '%' prefix)")
+    } else if input.starts_with('[') {
+        anyhow::bail!("{V1_UNSUPPORTED_MSG} (detected V1 JSON array format)")
     } else {
         anyhow::bail!("unsupported encryption format")
     }
@@ -434,6 +451,51 @@ mod tests {
         let result = decrypt_string("plain text", &master_key, "pp");
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("unsupported"));
+    }
+
+    #[test]
+    fn test_decrypt_string_rejects_v1_json_array() {
+        let master_key = test_master_key();
+        let result = decrypt_string("[\"encrypted\",\"data\"]", &master_key, "pp");
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.contains("V1 encryption not supported"), "got: {msg}");
+        assert!(msg.contains("V1 JSON array"), "got: {msg}");
+    }
+
+    #[test]
+    fn test_decrypt_string_rejects_v2_legacy_bare_percent() {
+        let master_key = test_master_key();
+        let result = decrypt_string("%abc123base64data", &master_key, "pp");
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.contains("V1 encryption not supported"), "got: {msg}");
+        assert!(msg.contains("V2 legacy '%'"), "got: {msg}");
+    }
+
+    #[test]
+    fn test_decrypt_string_rejects_v3_legacy_tilde_prefix() {
+        let master_key = test_master_key();
+        let result = decrypt_string("%~abc123base64data", &master_key, "pp");
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.contains("V1 encryption not supported"), "got: {msg}");
+        assert!(msg.contains("V3 legacy '%~'"), "got: {msg}");
+    }
+
+    #[test]
+    fn test_decrypt_string_v2_hkdf_still_works_with_percent_prefix() {
+        // Ensure `%=` and `%$` are not caught by the bare `%` check.
+        let master_key = test_master_key();
+        let encrypted = encrypt_hkdf("test", &master_key, &TEST_IV, &TEST_HKDF_SALT);
+        assert!(encrypted.starts_with("%="));
+        assert!(decrypt_string(&encrypted, &master_key, TEST_PASSPHRASE).is_ok());
+
+        let encrypted_eph = encrypt_ephemeral(
+            "test", TEST_PASSPHRASE, &TEST_PBKDF2_SALT, &TEST_IV, &TEST_HKDF_SALT,
+        );
+        assert!(encrypted_eph.starts_with("%$"));
+        assert!(decrypt_string(&encrypted_eph, &[0u8; 32], TEST_PASSPHRASE).is_ok());
     }
 
     // =====================================================================

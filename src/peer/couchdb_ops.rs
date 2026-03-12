@@ -36,6 +36,7 @@ pub(crate) async fn upload_to_couchdb(
         tweaks.minimum_chunk_size,
         e2ee,
         &tweaks.hash_alg,
+        &tweaks.chunk_splitter_version,
     )?;
 
     // Write chunks (content-addressed, idempotent — outside retry loop)
@@ -117,7 +118,7 @@ pub(crate) async fn upload_to_couchdb(
         }
     }
 
-    Ok(())
+    unreachable!("all retry attempts return from within the loop")
 }
 
 /// Soft-delete a document in CouchDB: get_doc (rev) → build tombstone → put_doc (with retry).
@@ -197,7 +198,7 @@ pub(crate) async fn soft_delete_from_couchdb(
         }
     }
 
-    Ok(())
+    unreachable!("all retry attempts return from within the loop")
 }
 
 /// Apply base_dir filtering and strip the prefix, returning the relative path.
