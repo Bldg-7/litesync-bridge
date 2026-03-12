@@ -21,18 +21,29 @@ struct Cli {
     /// Reset all state (since sequences) and restart from scratch
     #[arg(long)]
     reset: bool,
+
+    /// Output logs in JSON format (for systemd journal / structured logging)
+    #[arg(long)]
+    log_json: bool,
 }
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info,litesync_bridge=debug,litesync_commonlib=debug".into()),
-        )
-        .init();
-
     let cli = Cli::parse();
+
+    let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| "info,litesync_bridge=debug,litesync_commonlib=debug".into());
+
+    if cli.log_json {
+        tracing_subscriber::fmt()
+            .json()
+            .with_env_filter(env_filter)
+            .init();
+    } else {
+        tracing_subscriber::fmt()
+            .with_env_filter(env_filter)
+            .init();
+    }
 
     tracing::info!(
         version = env!("CARGO_PKG_VERSION"),
@@ -41,6 +52,9 @@ async fn main() -> anyhow::Result<()> {
     );
 
     let config = config::Config::load(&cli.config)?;
+    config.validate()?;
+    config.log_summary();
+
     let data_dir = cli
         .config
         .parent()
@@ -59,8 +73,15 @@ async fn main() -> anyhow::Result<()> {
     let cancel_for_signal = cancel.clone();
 
     tokio::spawn(async move {
-        tokio::signal::ctrl_c().await.ok();
-        tracing::info!("received ctrl-c, shutting down...");
+        let ctrl_c = tokio::signal::ctrl_c();
+        let mut sigterm = tokio::signal::unix::signal(
+            tokio::signal::unix::SignalKind::terminate(),
+        )
+        .expect("failed to register SIGTERM handler");
+        tokio::select! {
+            _ = ctrl_c => tracing::info!("received SIGINT, shutting down..."),
+            _ = sigterm.recv() => tracing::info!("received SIGTERM, shutting down..."),
+        }
         cancel_for_signal.cancel();
     });
 
