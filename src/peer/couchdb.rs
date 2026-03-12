@@ -8,10 +8,10 @@ use tokio_util::sync::CancellationToken;
 
 use litesync_commonlib::chunk::{self, E2EEContext};
 use litesync_commonlib::couchdb::{CouchDBClient, CouchDBHttpError, RemoteTweaks};
-use litesync_commonlib::crypto;
 use litesync_commonlib::doc::{RawNoteEntry, TYPE_NEWNOTE, TYPE_PLAIN};
 use litesync_commonlib::path;
-use std::time::{SystemTime, UNIX_EPOCH};
+
+use super::couchdb_ops;
 
 use crate::bridge::{ChangeEvent, PeerMessage};
 use crate::config::CouchDBPeerConfig;
@@ -347,20 +347,8 @@ impl CouchDBPeer {
         self.path_cache.get(doc_id)
     }
 
-    /// Apply base_dir filtering and strip the prefix, returning the relative path.
     fn apply_base_dir_filter(&self, full_path: &str) -> Option<String> {
-        if self.base_dir.is_empty() {
-            return Some(full_path.to_string());
-        }
-        if !full_path.starts_with(&self.base_dir) {
-            return None;
-        }
-        Some(
-            full_path
-                .strip_prefix(&self.base_dir)
-                .unwrap_or(full_path)
-                .to_string(),
-        )
+        couchdb_ops::apply_base_dir_filter(&self.base_dir, full_path)
     }
 
     async fn process_change(
@@ -445,100 +433,26 @@ impl CouchDBPeer {
                 let doc_id =
                     path::path2id(&full_path, self.obfuscate_passphrase.as_deref(), self.case_sensitive);
 
-                // Split content into chunks using remote tweak values
-                let result = chunk::disassemble(
-                    &data,
-                    &filename,
-                    self.tweaks.piece_size(),
-                    self.tweaks.minimum_chunk_size,
+                couchdb_ops::upload_to_couchdb(
+                    &self.client,
                     self.e2ee.as_ref(),
-                )?;
+                    &self.tweaks,
+                    &doc_id,
+                    &full_path,
+                    &filename,
+                    &data,
+                    mtime,
+                    ctime,
+                    is_binary,
+                    &self.rev_tracker,
+                    &self.path_cache,
+                )
+                .await?;
 
-                // Write chunks (content-addressed, idempotent — outside retry loop)
-                self.client.put_chunks(&result.chunks).await?;
-
-                let doc_type = if is_binary { TYPE_NEWNOTE } else { TYPE_PLAIN };
-
-                for attempt in 0..MAX_CONFLICT_RETRIES {
-                    // Fetch existing doc for _rev and eden preservation
-                    let (existing_rev, existing_eden) = self
-                        .client
-                        .get_doc::<serde_json::Value>(&doc_id)
-                        .await
-                        .ok()
-                        .map(|d| {
-                            let rev = d
-                                .get("_rev")
-                                .and_then(|v| v.as_str())
-                                .map(String::from);
-                            let eden = d.get("eden").cloned().unwrap_or(serde_json::json!({}));
-                            (rev, eden)
-                        })
-                        .unwrap_or((None, serde_json::json!({})));
-
-                    // Build parent document (E2EE: encrypt_meta uses random IV each call,
-                    // but decrypt produces the same plaintext — safe to retry)
-                    let (path_field, doc_ctime, doc_mtime, doc_size, doc_children) =
-                        if let Some(ref ctx) = self.e2ee {
-                            let encrypted = crypto::encrypt_meta(
-                                &full_path,
-                                mtime,
-                                ctime,
-                                data.len() as u64,
-                                &result.children,
-                                &ctx.master_key,
-                            )?;
-                            (encrypted, 0u64, 0u64, 0u64, Vec::<String>::new())
-                        } else {
-                            (
-                                full_path.clone(),
-                                ctime,
-                                mtime,
-                                data.len() as u64,
-                                result.children.clone(),
-                            )
-                        };
-
-                    let mut doc = serde_json::json!({
-                        "_id": doc_id,
-                        "type": doc_type,
-                        "path": path_field,
-                        "ctime": doc_ctime,
-                        "mtime": doc_mtime,
-                        "size": doc_size,
-                        "children": doc_children,
-                        "eden": existing_eden,
-                    });
-                    if let Some(rev) = existing_rev {
-                        doc["_rev"] = serde_json::json!(rev);
-                    }
-
-                    match self.client.put_doc(&doc_id, &doc).await {
-                        Ok(resp) => {
-                            self.rev_tracker.record(resp.rev.clone());
-                            // Cache for future delete resolution
-                            self.path_cache
-                                .insert(doc_id.clone(), filename.to_string());
-                            tracing::debug!(
-                                peer = %self.name, path = %filename,
-                                chunks = result.chunks.len(), rev = %resp.rev,
-                                "wrote document"
-                            );
-                            break;
-                        }
-                        Err(e)
-                            if attempt < MAX_CONFLICT_RETRIES - 1
-                                && is_conflict(&e) =>
-                        {
-                            tracing::debug!(
-                                peer = %self.name, doc_id = %doc_id,
-                                attempt, "409 conflict on put, retrying"
-                            );
-                            continue;
-                        }
-                        Err(e) => return Err(e),
-                    }
-                }
+                tracing::debug!(
+                    peer = %self.name, path = %filename,
+                    "wrote document"
+                );
             }
             ChangeEvent::Deleted { path } => {
                 let filename = path.to_string_lossy();
@@ -551,87 +465,19 @@ impl CouchDBPeer {
                 let doc_id =
                     path::path2id(&full_path, self.obfuscate_passphrase.as_deref(), self.case_sensitive);
 
-                let now_ms = SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_millis() as u64;
+                couchdb_ops::soft_delete_from_couchdb(
+                    &self.client,
+                    self.e2ee.as_ref(),
+                    &doc_id,
+                    &full_path,
+                    &self.rev_tracker,
+                )
+                .await?;
 
-                for attempt in 0..MAX_CONFLICT_RETRIES {
-                    // Fetch current doc for _rev (required for CouchDB update)
-                    let existing: serde_json::Value = match self.client.get_doc(&doc_id).await {
-                        Ok(d) => d,
-                        Err(e) if is_not_found(&e) => {
-                            // Already deleted
-                            tracing::debug!(
-                                peer = %self.name, path = %filename,
-                                "doc already deleted"
-                            );
-                            return Ok(());
-                        }
-                        Err(e) => {
-                            return Err(e);
-                        }
-                    };
-
-                    let rev = existing
-                        .get("_rev")
-                        .and_then(|v| v.as_str())
-                        .ok_or_else(|| anyhow::anyhow!("missing _rev on {doc_id}"))?;
-
-                    // Soft-delete: PUT the document back with `deleted: true`,
-                    // matching the Obsidian LiveSync plugin protocol. This keeps
-                    // the document visible in the changes feed so other clients
-                    // can detect the deletion.
-                    let (path_field, doc_mtime) = if let Some(ref ctx) = self.e2ee {
-                        let encrypted = crypto::encrypt_meta(
-                            &full_path,
-                            now_ms,
-                            0,  // ctime
-                            0,  // size
-                            &[], // children
-                            &ctx.master_key,
-                        )?;
-                        (encrypted, 0u64)
-                    } else {
-                        (full_path.clone(), now_ms)
-                    };
-
-                    let doc = serde_json::json!({
-                        "_id": doc_id,
-                        "_rev": rev,
-                        "type": TYPE_NEWNOTE,
-                        "path": path_field,
-                        "ctime": 0u64,
-                        "mtime": doc_mtime,
-                        "size": 0u64,
-                        "children": Vec::<String>::new(),
-                        "eden": {},
-                        "data": "",
-                        "deleted": true,
-                    });
-
-                    match self.client.put_doc(&doc_id, &doc).await {
-                        Ok(resp) => {
-                            self.rev_tracker.record(resp.rev.clone());
-                            tracing::debug!(
-                                peer = %self.name, path = %filename,
-                                rev = %resp.rev, "soft-deleted document"
-                            );
-                            break;
-                        }
-                        Err(e)
-                            if attempt < MAX_CONFLICT_RETRIES - 1
-                                && is_conflict(&e) =>
-                        {
-                            tracing::debug!(
-                                peer = %self.name, doc_id = %doc_id,
-                                attempt, "409 conflict on soft-delete, retrying"
-                            );
-                            continue;
-                        }
-                        Err(e) => return Err(e),
-                    }
-                }
+                tracing::debug!(
+                    peer = %self.name, path = %filename,
+                    "soft-deleted document"
+                );
             }
         }
 

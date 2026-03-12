@@ -7,14 +7,11 @@ use tokio_util::sync::CancellationToken;
 
 use litesync_commonlib::chunk::{self, E2EEContext};
 use litesync_commonlib::couchdb::{CouchDBClient, RemoteTweaks};
-use litesync_commonlib::crypto;
 use litesync_commonlib::doc::{RawNoteEntry, TYPE_NEWNOTE, TYPE_PLAIN};
 use litesync_commonlib::path;
 
-use crate::peer::couchdb::{
-    is_conflict, is_hidden_path, is_not_found, CouchDBPeer,
-    MAX_CONFLICT_RETRIES,
-};
+use crate::peer::couchdb::{is_hidden_path, CouchDBPeer};
+use crate::peer::couchdb_ops;
 use crate::peer::storage::StoragePeer;
 use crate::state::{PathCache, RevTracker, SinceTracker, StatCache};
 
@@ -380,12 +377,7 @@ fn resolve_deleted_path_static(
 }
 
 fn apply_base_dir_filter(base_dir_prefix: &str, full_path: &str) -> Option<String> {
-    if base_dir_prefix.is_empty() {
-        return Some(full_path.to_string());
-    }
-    full_path
-        .strip_prefix(base_dir_prefix)
-        .map(|s| s.to_string())
+    couchdb_ops::apply_base_dir_filter(base_dir_prefix, full_path)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -639,81 +631,12 @@ async fn execute_upload(
     };
 
     let doc_id = path::path2id(&full_path, obfuscate_passphrase, tweaks.handle_filename_case_sensitive);
-    let result = chunk::disassemble(&data, rel_path, tweaks.piece_size(), tweaks.minimum_chunk_size, e2ee)?;
 
-    // Write chunks (content-addressed, idempotent — outside retry loop)
-    client.put_chunks(&result.chunks).await?;
-
-    let doc_type = if is_binary { TYPE_NEWNOTE } else { TYPE_PLAIN };
-
-    // Retry loop matching CouchDBPeer::handle_write
-    for attempt in 0..MAX_CONFLICT_RETRIES {
-        // Fetch existing doc for _rev and eden preservation
-        let (existing_rev, existing_eden) = client
-            .get_doc::<serde_json::Value>(&doc_id)
-            .await
-            .ok()
-            .map(|d| {
-                let rev = d
-                    .get("_rev")
-                    .and_then(|v| v.as_str())
-                    .map(String::from);
-                let eden = d.get("eden").cloned().unwrap_or(serde_json::json!({}));
-                (rev, eden)
-            })
-            .unwrap_or((None, serde_json::json!({})));
-
-        let (path_field, doc_ctime, doc_mtime, doc_size, doc_children) =
-            if let Some(ctx) = e2ee {
-                let encrypted = litesync_commonlib::crypto::encrypt_meta(
-                    &full_path,
-                    mtime,
-                    ctime,
-                    size,
-                    &result.children,
-                    &ctx.master_key,
-                )?;
-                (encrypted, 0u64, 0u64, 0u64, Vec::<String>::new())
-            } else {
-                (
-                    full_path.clone(),
-                    ctime,
-                    mtime,
-                    size,
-                    result.children.clone(),
-                )
-            };
-
-        let mut doc = serde_json::json!({
-            "_id": doc_id,
-            "type": doc_type,
-            "path": path_field,
-            "ctime": doc_ctime,
-            "mtime": doc_mtime,
-            "size": doc_size,
-            "children": doc_children,
-            "eden": existing_eden,
-        });
-        if let Some(rev) = existing_rev {
-            doc["_rev"] = serde_json::json!(rev);
-        }
-
-        match client.put_doc(&doc_id, &doc).await {
-            Ok(resp) => {
-                rev_tracker.record(resp.rev);
-                path_cache.insert(doc_id.clone(), rel_path.to_string());
-                break;
-            }
-            Err(e) if attempt < MAX_CONFLICT_RETRIES - 1 && is_conflict(&e) => {
-                tracing::debug!(
-                    doc_id = %doc_id, attempt,
-                    "409 conflict on reconciliation put, retrying"
-                );
-                continue;
-            }
-            Err(e) => return Err(e),
-        }
-    }
+    couchdb_ops::upload_to_couchdb(
+        client, e2ee, tweaks, &doc_id, &full_path, rel_path,
+        &data, mtime, ctime, is_binary, rev_tracker, path_cache,
+    )
+    .await?;
 
     Ok((mtime, size))
 }
@@ -726,75 +649,16 @@ async fn execute_delete_remote(
     rel_path: &str,
     rev_tracker: &Arc<RevTracker>,
 ) -> anyhow::Result<()> {
-    let now_ms = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64;
-
     let full_path = if base_dir_prefix.is_empty() {
         rel_path.to_string()
     } else {
         format!("{base_dir_prefix}{rel_path}")
     };
 
-    for attempt in 0..MAX_CONFLICT_RETRIES {
-        let existing: serde_json::Value = match client.get_doc(doc_id).await {
-            Ok(d) => d,
-            Err(e) if is_not_found(&e) => return Ok(()),
-            Err(e) => return Err(e),
-        };
-
-        let rev = existing
-            .get("_rev")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| anyhow::anyhow!("missing _rev on {doc_id}"))?;
-
-        // Soft-delete: PUT the document back with `deleted: true`,
-        // matching the Obsidian LiveSync plugin protocol.
-        let (path_field, doc_mtime) = if let Some(ctx) = e2ee {
-            let encrypted = crypto::encrypt_meta(
-                &full_path,
-                now_ms,
-                0,  // ctime
-                0,  // size
-                &[], // children
-                &ctx.master_key,
-            )?;
-            (encrypted, 0u64)
-        } else {
-            (full_path.clone(), now_ms)
-        };
-
-        let doc = serde_json::json!({
-            "_id": doc_id,
-            "_rev": rev,
-            "type": TYPE_NEWNOTE,
-            "path": path_field,
-            "ctime": 0u64,
-            "mtime": doc_mtime,
-            "size": 0u64,
-            "children": Vec::<String>::new(),
-            "eden": {},
-            "data": "",
-            "deleted": true,
-        });
-
-        match client.put_doc(doc_id, &doc).await {
-            Ok(resp) => {
-                rev_tracker.record(resp.rev);
-                return Ok(());
-            }
-            Err(e) if attempt < MAX_CONFLICT_RETRIES - 1 && is_conflict(&e) => {
-                tracing::debug!(
-                    doc_id = %doc_id, attempt,
-                    "409 conflict on reconciliation soft-delete, retrying"
-                );
-                continue;
-            }
-            Err(e) => return Err(e),
-        }
-    }
-    Ok(())
+    couchdb_ops::soft_delete_from_couchdb(
+        client, e2ee, doc_id, &full_path, rev_tracker,
+    )
+    .await
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
