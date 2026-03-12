@@ -8,7 +8,7 @@ use tokio_util::sync::CancellationToken;
 
 use litesync_commonlib::chunk::{self, E2EEContext};
 use litesync_commonlib::couchdb::{CouchDBClient, CouchDBHttpError, RemoteTweaks};
-use litesync_commonlib::doc::{RawNoteEntry, TYPE_NEWNOTE, TYPE_PLAIN};
+use litesync_commonlib::doc::RawNoteEntry;
 use litesync_commonlib::path;
 
 use super::couchdb_ops;
@@ -248,7 +248,7 @@ impl CouchDBPeer {
                         };
 
                         // Only process note documents
-                        if raw.type_ != TYPE_PLAIN && raw.type_ != TYPE_NEWNOTE {
+                        if !raw.is_note() {
                             continue;
                         }
 

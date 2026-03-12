@@ -7,7 +7,7 @@ use tokio_util::sync::CancellationToken;
 
 use litesync_commonlib::chunk::{self, E2EEContext};
 use litesync_commonlib::couchdb::{CouchDBClient, RemoteTweaks};
-use litesync_commonlib::doc::{RawNoteEntry, TYPE_NEWNOTE, TYPE_PLAIN};
+use litesync_commonlib::doc::RawNoteEntry;
 use litesync_commonlib::path;
 
 use crate::peer::couchdb::{is_hidden_path, CouchDBPeer};
@@ -297,7 +297,7 @@ pub async fn fetch_remote_entries(
             Err(_) => continue,
         };
 
-        if raw.type_ != TYPE_PLAIN && raw.type_ != TYPE_NEWNOTE {
+        if !raw.is_note() {
             continue;
         }
 

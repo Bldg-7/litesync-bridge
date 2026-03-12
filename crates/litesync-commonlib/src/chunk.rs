@@ -280,6 +280,24 @@ fn u32_to_base36(n: u32) -> String {
     u64_to_base36(n as u64)
 }
 
+/// Convert a signed 32-bit integer to base-36, matching JavaScript's
+/// `Number.prototype.toString(36)` behavior for signed values.
+///
+/// In JS, bitwise XOR (`^`) returns a signed 32-bit integer, and
+/// `.toString(36)` on a negative number produces `"-"` followed by the
+/// base-36 representation of the absolute value.
+fn i32_to_base36(n: i32) -> String {
+    if n == 0 {
+        return "0".to_string();
+    }
+    if n < 0 {
+        // JS: (-123).toString(36) === "-3f"
+        format!("-{}", u64_to_base36((n as i64).unsigned_abs()))
+    } else {
+        u64_to_base36(n as u64)
+    }
+}
+
 /// Compute the hashed passphrase for chunk ID generation.
 ///
 /// Replicates `HashManagerCore.applyOptions` from the TS LiveSync plugin:
@@ -307,14 +325,28 @@ fn hash_passphrase_for_chunks(passphrase: &str) -> String {
     fallback_mixed_hash_each(&salted)
 }
 
-/// Compute a content-addressed chunk ID using xxhash64.
+/// Compute a content-addressed chunk ID.
 ///
-/// Replicates the LiveSync `XXHash64HashManager.computeHash` algorithm:
+/// Supports two algorithms selected by `hash_alg`:
+///
+/// ## xxhash32 (legacy) — `hash_alg == ""` or `hash_alg == "xxhash32"`
+///
+/// Replicates the LiveSync `XXHash32RawHashManager.computeHash` XOR algorithm:
+/// - With passphrase: `(h32(piece_bytes) ^ hashedPassphrase32 ^ piece.length) as i32` in base-36
+/// - Without passphrase: `(h32(piece_bytes) ^ piece.length) as i32` in base-36
+///
+/// Where `hashedPassphrase32` is `xxh32(fallbackMixedHashEach(SALT_OF_ID + passphrase[0..75%]))`.
+/// The `piece.length` uses JavaScript's UTF-16 code unit count.
+/// The XOR result is cast to `i32` (matching JS bitwise `^` signed semantics) before
+/// base-36 conversion, so negative values produce a `"-"` prefix.
+///
+/// ## xxhash64 — `hash_alg == "xxhash64"` (or any other non-legacy value)
+///
+/// Replicates the LiveSync `XXHash64HashManager.computeHash` string-concat algorithm:
 /// - With passphrase: `h64("{piece}-{hashedPassphrase}-{piece.utf16_len}")` in base-36
 /// - Without passphrase: `h64("{piece}-{piece.utf16_len}")` in base-36
 ///
 /// Where `hashedPassphrase` is MurmurHash3+FNV-1a of `SALT_OF_ID + passphrase[0..75%]`.
-/// The `piece_utf16_len` uses UTF-16 code unit count to match JS `piece.length`.
 ///
 /// The returned ID uses the `h:+` prefix when E2EE is enabled (passphrase provided),
 /// or the `h:` prefix otherwise, matching the TS plugin's `HashManagerCore.computeHash`
@@ -322,17 +354,36 @@ fn hash_passphrase_for_chunks(passphrase: &str) -> String {
 pub fn chunk_id(piece: &str, passphrase: Option<&str>, hash_alg: &str) -> String {
     let piece_utf16_len: usize = piece.chars().map(|c| c.len_utf16()).sum();
 
-    let (prefix, hash_input) = if let Some(pp) = passphrase {
-        let hashed_pp = hash_passphrase_for_chunks(pp);
-        (PREFIX_ENCRYPTED_CHUNK, format!("{}-{}-{}", piece, hashed_pp, piece_utf16_len))
+    let prefix = if passphrase.is_some() {
+        PREFIX_ENCRYPTED_CHUNK
     } else {
-        (PREFIX_CHUNK, format!("{}-{}", piece, piece_utf16_len))
+        PREFIX_CHUNK
     };
 
-    if hash_alg == "xxhash32" {
-        let hash = xxhash_rust::xxh32::xxh32(hash_input.as_bytes(), 0);
-        format!("{}{}", prefix, u64_to_base36(hash as u64))
+    if hash_alg.is_empty() || hash_alg == "xxhash32" {
+        // Legacy xxhash32 XOR algorithm (XXHash32RawHashManager)
+        let piece_bytes = piece.as_bytes();
+        let piece_hash = xxhash_rust::xxh32::xxh32(piece_bytes, 0);
+
+        let hash = if let Some(pp) = passphrase {
+            let hashed_pp = hash_passphrase_for_chunks(pp);
+            let hashed_pp_bytes = hashed_pp.as_bytes();
+            let hashed_pp32 = xxhash_rust::xxh32::xxh32(hashed_pp_bytes, 0);
+            piece_hash ^ hashed_pp32 ^ (piece_utf16_len as u32)
+        } else {
+            piece_hash ^ (piece_utf16_len as u32)
+        };
+
+        // JS bitwise XOR returns signed 32-bit; .toString(36) respects sign
+        format!("{}{}", prefix, i32_to_base36(hash as i32))
     } else {
+        // xxhash64 string-concat algorithm (XXHash64HashManager)
+        let hash_input = if let Some(pp) = passphrase {
+            let hashed_pp = hash_passphrase_for_chunks(pp);
+            format!("{}-{}-{}", piece, hashed_pp, piece_utf16_len)
+        } else {
+            format!("{}-{}", piece, piece_utf16_len)
+        };
         let hash = xxhash_rust::xxh64::xxh64(hash_input.as_bytes(), 0);
         format!("{}{}", prefix, u64_to_base36(hash))
     }
@@ -553,11 +604,11 @@ pub fn disassemble(
     let passphrase_for_hash = e2ee.map(|ctx| ctx.passphrase.as_str());
 
     // Text files: raw text pieces; Binary files: base64 pieces
-    // Use should_split_as_plain_text (md, txt, canvas) — NOT is_plain_text —
-    // to match the TS plugin's shouldSplitAsPlainText() split decision.
-    // is_plain_text covers more extensions (css, js, html, svg, csv, xml) and
-    // is used elsewhere for doc type determination, not for splitting.
-    let is_text = path::should_split_as_plain_text(filename);
+    // Use is_plain_text (md, txt, svg, html, csv, css, js, xml, canvas) to match
+    // the TS plugin's isTextBlob() which decides text vs binary splitting.
+    // Within the text path, should_split_as_plain_text (md, txt, canvas) further
+    // controls newline-based vs character-based splitting in split_text.
+    let is_text = path::is_plain_text(filename);
     let pieces = if is_text {
         let text = std::str::from_utf8(content)
             .map_err(|e| anyhow::anyhow!("invalid UTF-8 for text file: {e}"))?;
@@ -594,6 +645,7 @@ pub fn disassemble(
             type_: TYPE_LEAF.to_string(),
             data,
             is_corrupted: None,
+            e_encrypted: if e2ee.is_some() { Some(true) } else { None },
         });
     }
 
@@ -977,6 +1029,54 @@ mod tests {
         assert!(id.starts_with("h:+"), "E2EE xxhash32 chunk ID should start with 'h:+'");
     }
 
+    #[test]
+    fn test_chunk_id_xxhash32_empty_hash_alg_is_legacy() {
+        // Legacy databases use hash_alg == "" which should route to xxhash32
+        let piece = "SGVsbG8=";
+        let id_empty = chunk_id(piece, None, "");
+        let id_xxhash32 = chunk_id(piece, None, "xxhash32");
+        assert_eq!(id_empty, id_xxhash32,
+            "empty hash_alg must produce the same ID as 'xxhash32'");
+    }
+
+    #[test]
+    fn test_chunk_id_xxhash32_matches_ts_without_encryption() {
+        // Verified against TS XXHash32RawHashManager.computeHashWithoutEncryption:
+        //   (h32Raw(encode("SGVsbG8=")) ^ 8).toString(36) === "-1i301m"
+        let piece = "SGVsbG8=";
+        let id = chunk_id(piece, None, "xxhash32");
+        assert_eq!(id, "h:-1i301m");
+    }
+
+    #[test]
+    fn test_chunk_id_xxhash32_matches_ts_positive_result() {
+        // Verified against TS: (h32Raw(encode("test content")) ^ 12).toString(36) === "r9ucpo"
+        let piece = "test content";
+        let id = chunk_id(piece, None, "xxhash32");
+        assert_eq!(id, "h:r9ucpo");
+    }
+
+    #[test]
+    fn test_chunk_id_xxhash32_matches_ts_with_encryption() {
+        // Verified against TS XXHash32RawHashManager.computeHashWithEncryption:
+        //   hashedPassphrase = fallbackMixedHashEach(SALT_OF_ID + "my-passphrase"[0..75%])
+        //   hashedPassphrase32 = h32Raw(encode(hashedPassphrase))
+        //   (h32Raw(encode("SGVsbG8=")) ^ hashedPassphrase32 ^ 8).toString(36) === "-grd23m"
+        let piece = "SGVsbG8=";
+        let id = chunk_id(piece, Some("my-passphrase"), "xxhash32");
+        assert_eq!(id, "h:+-grd23m");
+    }
+
+    #[test]
+    fn test_chunk_id_xxhash32_negative_i32_high_bit() {
+        // "chunk0" produces h32 with high bit set after XOR with length,
+        // yielding negative i32 in JS.
+        // Verified against TS: (h32Raw(encode("chunk0")) ^ 6).toString(36) === "-upzatc"
+        let piece = "chunk0";
+        let id = chunk_id(piece, None, "xxhash32");
+        assert_eq!(id, "h:-upzatc");
+    }
+
     // =====================================================================
     // Phase 2: u64_to_base36
     // =====================================================================
@@ -999,6 +1099,32 @@ mod tests {
         assert_eq!(u64_to_base36(1_000_000), "lfls");
         // JS: BigInt(0xdeadbeef).toString(36) === "1ps9wxb"
         assert_eq!(u64_to_base36(0xDEAD_BEEF), "1ps9wxb");
+    }
+
+    // =====================================================================
+    // Phase 2: i32_to_base36
+    // =====================================================================
+
+    #[test]
+    fn test_i32_to_base36_zero() {
+        assert_eq!(i32_to_base36(0), "0");
+    }
+
+    #[test]
+    fn test_i32_to_base36_positive() {
+        // JS: (42).toString(36) === "16"
+        assert_eq!(i32_to_base36(42), "16");
+        assert_eq!(i32_to_base36(2_147_483_647), "zik0zj"); // i32::MAX
+    }
+
+    #[test]
+    fn test_i32_to_base36_negative() {
+        // JS: (-1).toString(36) === "-1"
+        assert_eq!(i32_to_base36(-1), "-1");
+        // JS: (-123).toString(36) === "-3f"
+        assert_eq!(i32_to_base36(-123), "-3f");
+        // JS: (-2147483648).toString(36) === "-zik0zk"  (i32::MIN)
+        assert_eq!(i32_to_base36(-2_147_483_648), "-zik0zk");
     }
 
     // =====================================================================
@@ -1404,10 +1530,10 @@ mod tests {
     }
 
     #[test]
-    fn test_disassemble_css_js_html_use_binary_splitting() {
-        // H5 fix: CSS, JS, HTML, SVG, CSV, XML must use binary splitting
-        // (matching the TS plugin's shouldSplitAsPlainText), not text splitting.
-        // Only md, txt, canvas use text splitting.
+    fn test_disassemble_css_js_html_svg_csv_xml_use_text_splitting() {
+        // CSS, JS, HTML, SVG, CSV, XML are text files (matching the TS plugin's
+        // isTextBlob()) and must use text splitting, not binary splitting.
+        // This ensures chunk IDs are compatible with the Obsidian plugin.
         let content = b"body { color: red; }\n.foo { display: block; }\n";
 
         for ext in &["css", "js", "html", "svg", "csv", "xml"] {
@@ -1415,24 +1541,39 @@ mod tests {
             let result = disassemble(content, &filename, 1000, 20, None, "xxhash64").unwrap();
             assert!(!result.chunks.is_empty(), "{filename} should produce chunks");
 
-            // Binary-split chunks are base64-encoded. Verify each chunk decodes
-            // from base64 (text chunks would be raw text, not valid base64).
+            // Text-split chunks are raw text, not base64.
+            // Concatenation of raw chunk data should equal original content.
+            let reconstructed: String = result.children.iter()
+                .map(|id| {
+                    let chunk = result.chunks.iter().find(|c| &c._id == id).unwrap();
+                    chunk.data.clone()
+                })
+                .collect();
+            assert_eq!(
+                reconstructed,
+                std::str::from_utf8(content).unwrap(),
+                "{filename}: text roundtrip failed"
+            );
+        }
+    }
+
+    #[test]
+    fn test_disassemble_binary_files_still_use_binary_splitting() {
+        // Non-text files (png, zip, pdf, etc.) must still use binary (base64) splitting.
+        let content = b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR";
+
+        for ext in &["png", "jpg", "zip", "pdf", "woff2"] {
+            let filename = format!("test.{ext}");
+            let result = disassemble(content, &filename, 1000, 20, None, "xxhash64").unwrap();
+            assert!(!result.chunks.is_empty(), "{filename} should produce chunks");
+
+            // Binary-split chunks are base64-encoded.
             for chunk in &result.chunks {
                 assert!(
                     BASE64.decode(&chunk.data).is_ok(),
                     "{filename}: chunk data should be base64 (binary split), got raw text"
                 );
             }
-
-            // Roundtrip: decode base64 chunks and verify content matches
-            let reconstructed: Vec<u8> = result.children.iter()
-                .map(|id| {
-                    let chunk = result.chunks.iter().find(|c| &c._id == id).unwrap();
-                    BASE64.decode(&chunk.data).unwrap()
-                })
-                .flatten()
-                .collect();
-            assert_eq!(reconstructed, content, "{filename}: binary roundtrip failed");
         }
     }
 

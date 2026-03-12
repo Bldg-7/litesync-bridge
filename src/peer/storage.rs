@@ -63,7 +63,7 @@ impl StoragePeer {
             }
         });
 
-        let p = peer;
+        let p = peer.clone();
         let c = cancel;
         let inbound_handle = tokio::spawn(async move {
             if let Err(e) = p.run_inbound(inbound_rx, c).await {
@@ -71,7 +71,15 @@ impl StoragePeer {
             }
         });
 
-        vec![watcher_handle, inbound_handle]
+        // Cleanup task: wait for both loops, then save stat cache once
+        let cleanup_handle = tokio::spawn(async move {
+            let _ = watcher_handle.await;
+            let _ = inbound_handle.await;
+            peer.save_stat_cache().await;
+            tracing::debug!(peer = %peer.name, "stat cache saved after shutdown");
+        });
+
+        vec![cleanup_handle]
     }
 
     // =========================================================================
@@ -214,9 +222,6 @@ impl StoragePeer {
             }
         }
 
-        // Save stat cache on shutdown
-        self.save_stat_cache().await;
-
         tracing::info!(peer = %self.name, "watcher loop stopped");
         Ok(())
     }
@@ -283,9 +288,6 @@ impl StoragePeer {
                 tracing::warn!(peer = %self.name, "file write failed: {e}");
             }
         }
-
-        // Save stat cache on shutdown (inbound loop)
-        self.save_stat_cache().await;
 
         tracing::info!(peer = %self.name, "inbound loop stopped");
         Ok(())

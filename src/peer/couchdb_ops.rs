@@ -85,6 +85,7 @@ pub(crate) async fn upload_to_couchdb(
         let mut doc = serde_json::json!({
             "_id": doc_id,
             "type": doc_type,
+            "datatype": doc_type,
             "path": path_field,
             "ctime": doc_ctime,
             "mtime": doc_mtime,
@@ -166,6 +167,7 @@ pub(crate) async fn soft_delete_from_couchdb(
             "_id": doc_id,
             "_rev": rev,
             "type": TYPE_NEWNOTE,
+            "datatype": TYPE_NEWNOTE,
             "path": path_field,
             "ctime": 0u64,
             "mtime": doc_mtime,

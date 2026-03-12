@@ -16,6 +16,7 @@ pub const EDEN_ENCRYPTED_KEY_HKDF: &str = "h:++encrypted-hkdf";
 pub const TYPE_PLAIN: &str = "plain";
 pub const TYPE_NEWNOTE: &str = "newnote";
 pub const TYPE_LEAF: &str = "leaf";
+pub const TYPE_NOTES_LEGACY: &str = "notes";
 
 // --- Document Models ---
 
@@ -37,6 +38,8 @@ pub struct EntryLeaf {
     pub data: String,
     #[serde(default, rename = "isCorrupted", skip_serializing_if = "Option::is_none")]
     pub is_corrupted: Option<bool>,
+    #[serde(default, rename = "e_", skip_serializing_if = "Option::is_none")]
+    pub e_encrypted: Option<bool>,
 }
 
 /// Raw note document from CouchDB. When E2EE is enabled, metadata fields
@@ -47,7 +50,7 @@ pub struct RawNoteEntry {
     pub _id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub _rev: Option<String>,
-    #[serde(rename = "type")]
+    #[serde(default, rename = "type")]
     pub type_: String,
     pub path: String,
     #[serde(default)]
@@ -105,7 +108,10 @@ impl RawNoteEntry {
     }
 
     pub fn is_note(&self) -> bool {
-        self.type_ == TYPE_PLAIN || self.type_ == TYPE_NEWNOTE
+        self.type_ == TYPE_PLAIN
+            || self.type_ == TYPE_NEWNOTE
+            || self.type_ == TYPE_NOTES_LEGACY
+            || self.type_.is_empty()
     }
 
     pub fn is_binary(&self) -> bool {
@@ -283,6 +289,8 @@ mod tests {
     fn test_is_note() {
         assert!(make_entry("plain", "x").is_note());
         assert!(make_entry("newnote", "x").is_note());
+        assert!(make_entry("notes", "x").is_note());
+        assert!(make_entry("", "x").is_note());
         assert!(!make_entry("leaf", "x").is_note());
     }
 
@@ -290,6 +298,8 @@ mod tests {
     fn test_is_binary() {
         assert!(make_entry("newnote", "x").is_binary());
         assert!(!make_entry("plain", "x").is_binary());
+        assert!(!make_entry("notes", "x").is_binary());
+        assert!(!make_entry("", "x").is_binary());
     }
 
     #[test]
@@ -334,6 +344,42 @@ mod tests {
         assert!(entry.is_deleted());
         assert!(entry.children.is_empty());
         assert_eq!(entry.size, 0);
+    }
+
+    #[test]
+    fn test_legacy_notes_type_deserialization() {
+        let json = r#"{
+            "_id": "notes/old.md",
+            "_rev": "1-abc",
+            "type": "notes",
+            "path": "notes/old.md",
+            "ctime": 1000,
+            "mtime": 2000,
+            "size": 50,
+            "children": ["h:chunk1"]
+        }"#;
+        let entry: RawNoteEntry = serde_json::from_str(json).unwrap();
+        assert_eq!(entry.type_, "notes");
+        assert!(entry.is_note());
+        assert!(!entry.is_binary());
+    }
+
+    #[test]
+    fn test_missing_type_field_deserialization() {
+        // Documents with no "type" field should deserialize with empty string
+        // and be treated as notes (matching TS `!obj.type` check).
+        let json = r#"{
+            "_id": "notes/legacy.md",
+            "path": "notes/legacy.md",
+            "ctime": 1000,
+            "mtime": 2000,
+            "size": 30,
+            "children": []
+        }"#;
+        let entry: RawNoteEntry = serde_json::from_str(json).unwrap();
+        assert_eq!(entry.type_, "");
+        assert!(entry.is_note());
+        assert!(!entry.is_binary());
     }
 
     #[test]
@@ -484,6 +530,7 @@ mod tests {
             type_: "leaf".into(),
             data: "SGVsbG8=".into(),
             is_corrupted: None,
+            e_encrypted: None,
         };
         let json = serde_json::to_string(&leaf).unwrap();
         let parsed: EntryLeaf = serde_json::from_str(&json).unwrap();
@@ -501,10 +548,12 @@ mod tests {
             type_: "leaf".into(),
             data: "SGVsbG8=".into(),
             is_corrupted: None,
+            e_encrypted: None,
         };
         let json = serde_json::to_string(&leaf).unwrap();
         assert!(!json.contains("_rev"), "None _rev should be omitted: {json}");
         assert!(!json.contains("isCorrupted"), "None isCorrupted should be omitted: {json}");
+        assert!(!json.contains("e_"), "None e_encrypted should be omitted: {json}");
     }
 
     #[test]
@@ -515,10 +564,57 @@ mod tests {
             type_: "leaf".into(),
             data: "SGVsbG8=".into(),
             is_corrupted: Some(false),
+            e_encrypted: None,
         };
         let json = serde_json::to_string(&leaf).unwrap();
         assert!(json.contains("\"_rev\":\"1-abc\""), "Some _rev should be included: {json}");
         assert!(json.contains("\"isCorrupted\":false"), "Some isCorrupted should be included: {json}");
+    }
+
+    #[test]
+    fn test_entry_leaf_e_encrypted_serialization() {
+        // When e_encrypted is Some(true), JSON should contain "e_": true
+        let leaf_encrypted = EntryLeaf {
+            _id: "h:test".into(),
+            _rev: None,
+            type_: "leaf".into(),
+            data: "SGVsbG8=".into(),
+            is_corrupted: None,
+            e_encrypted: Some(true),
+        };
+        let json = serde_json::to_string(&leaf_encrypted).unwrap();
+        assert!(json.contains("\"e_\":true"), "e_encrypted Some(true) should serialize as \"e_\":true: {json}");
+
+        // When e_encrypted is None, JSON should NOT contain "e_"
+        let leaf_plain = EntryLeaf {
+            _id: "h:test".into(),
+            _rev: None,
+            type_: "leaf".into(),
+            data: "SGVsbG8=".into(),
+            is_corrupted: None,
+            e_encrypted: None,
+        };
+        let json = serde_json::to_string(&leaf_plain).unwrap();
+        assert!(!json.contains("e_"), "e_encrypted None should omit \"e_\" entirely: {json}");
+
+        // Deserialize back from JSON with "e_": true
+        let json_with_e = r#"{
+            "_id": "h:test",
+            "type": "leaf",
+            "data": "SGVsbG8=",
+            "e_": true
+        }"#;
+        let parsed: EntryLeaf = serde_json::from_str(json_with_e).unwrap();
+        assert_eq!(parsed.e_encrypted, Some(true));
+
+        // Deserialize from JSON without "e_" field
+        let json_without_e = r#"{
+            "_id": "h:test",
+            "type": "leaf",
+            "data": "SGVsbG8="
+        }"#;
+        let parsed: EntryLeaf = serde_json::from_str(json_without_e).unwrap();
+        assert_eq!(parsed.e_encrypted, None);
     }
 
     #[test]
@@ -539,5 +635,6 @@ mod tests {
         assert_eq!(TYPE_PLAIN, "plain");
         assert_eq!(TYPE_NEWNOTE, "newnote");
         assert_eq!(TYPE_LEAF, "leaf");
+        assert_eq!(TYPE_NOTES_LEGACY, "notes");
     }
 }
