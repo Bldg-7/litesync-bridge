@@ -103,8 +103,8 @@ async fn test_put_chunks_idempotent() {
     };
 
     // Put twice — second should silently skip (409 conflict is OK for chunks).
-    db.client.put_chunks(&[chunk.clone()]).await.unwrap();
-    db.client.put_chunks(&[chunk]).await.unwrap();
+    db.client.put_chunks(std::slice::from_ref(&chunk)).await.unwrap();
+    db.client.put_chunks(std::slice::from_ref(&chunk)).await.unwrap();
 
     let fetched = db.client.get_chunks(&["h:dup".into()]).await.unwrap();
     assert_eq!(fetched.len(), 1);

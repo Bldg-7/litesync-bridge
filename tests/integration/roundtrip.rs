@@ -185,8 +185,10 @@ async fn test_roundtrip_binary_e2ee() {
 #[ignore]
 async fn test_roundtrip_rabin_karp_text() {
     let db = TestDb::new().await;
-    let mut tweaks = RemoteTweaks::default();
-    tweaks.chunk_splitter_version = "v3-rabin-karp".to_string();
+    let tweaks = RemoteTweaks {
+        chunk_splitter_version: "v3-rabin-karp".to_string(),
+        ..Default::default()
+    };
 
     let line = "Rabin-Karp content-defined chunking test line.\n";
     let content: String = line.repeat(3000);
@@ -205,8 +207,10 @@ async fn test_roundtrip_rabin_karp_e2ee() {
     db.seed_e2ee_salt(&salt_b64).await;
 
     let e2ee = E2EEContext::new(TEST_PASSPHRASE, TEST_SALT);
-    let mut tweaks = RemoteTweaks::default();
-    tweaks.chunk_splitter_version = "v3-rabin-karp".to_string();
+    let tweaks = RemoteTweaks {
+        chunk_splitter_version: "v3-rabin-karp".to_string(),
+        ..Default::default()
+    };
 
     let line = "Encrypted Rabin-Karp chunking test.\n";
     let content: String = line.repeat(3000);
@@ -256,8 +260,10 @@ async fn test_soft_delete() {
 #[ignore]
 async fn test_roundtrip_xxhash32() {
     let db = TestDb::new().await;
-    let mut tweaks = RemoteTweaks::default();
-    tweaks.hash_alg = "xxhash32".to_string();
+    let tweaks = RemoteTweaks {
+        hash_alg: "xxhash32".to_string(),
+        ..Default::default()
+    };
 
     let content = b"# xxhash32 test\n";
     roundtrip_file(&db, "xxhash32.md", content, None, &tweaks).await;
@@ -267,8 +273,10 @@ async fn test_roundtrip_xxhash32() {
 #[ignore]
 async fn test_roundtrip_sha1() {
     let db = TestDb::new().await;
-    let mut tweaks = RemoteTweaks::default();
-    tweaks.hash_alg = "sha1".to_string();
+    let tweaks = RemoteTweaks {
+        hash_alg: "sha1".to_string(),
+        ..Default::default()
+    };
 
     let content = b"# sha1 test\n";
     roundtrip_file(&db, "sha1-test.md", content, None, &tweaks).await;
@@ -278,8 +286,10 @@ async fn test_roundtrip_sha1() {
 #[ignore]
 async fn test_roundtrip_mixed_purejs() {
     let db = TestDb::new().await;
-    let mut tweaks = RemoteTweaks::default();
-    tweaks.hash_alg = "mixed-purejs".to_string();
+    let tweaks = RemoteTweaks {
+        hash_alg: "mixed-purejs".to_string(),
+        ..Default::default()
+    };
 
     let content = b"# mixed-purejs test\n";
     roundtrip_file(&db, "mixed.md", content, None, &tweaks).await;
