@@ -2,6 +2,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use notify::event::{ModifyKind, RenameMode};
 use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use parking_lot::Mutex;
 use tokio::sync::mpsc;
@@ -126,7 +127,7 @@ impl StoragePeer {
                 },
             };
 
-            for event_path in &event.paths {
+            for (path_idx, event_path) in event.paths.iter().enumerate() {
                 let rel = match event_path.strip_prefix(&self.base_dir) {
                     Ok(r) => r,
                     Err(_) => continue,
@@ -142,14 +143,102 @@ impl StoragePeer {
                     continue;
                 }
 
-                // Skip our own writes
-                if self.write_tracker.is_own_write(event_path) {
-                    tracing::trace!(peer = %self.name, path = %rel_str, "skipping own write");
-                    continue;
-                }
-
                 match event.kind {
+                    // Rename-from: old path in a mv — treat as deletion.
+                    // Must appear before the generic Modify(_) arm.
+                    EventKind::Modify(ModifyKind::Name(RenameMode::From)) => {
+                        // Never suppress Remove/RenameFrom with WriteTracker —
+                        // deletions (including mv source) must always propagate.
+                        if rel.extension().is_none() {
+                            let is_tracked = self.stat_cache.lock()
+                                .as_ref()
+                                .is_some_and(|c| c.existed(&rel_str));
+                            if !is_tracked {
+                                continue;
+                            }
+                        }
+                        self.remove_stat_cache(&rel_str);
+                        let msg = PeerMessage {
+                            source_name: self.name.clone(),
+                            group: self.group.clone(),
+                            event: ChangeEvent::Deleted {
+                                path: rel.to_path_buf(),
+                            },
+                        };
+                        if hub_tx.send(msg).await.is_err() {
+                            return Ok(());
+                        }
+                    }
+                    // Rename-both: paths[0] = old (delete), paths[1] = new (create).
+                    // Must appear before the generic Modify(_) arm.
+                    EventKind::Modify(ModifyKind::Name(RenameMode::Both)) => {
+                        if path_idx == 0 {
+                            // Old path — treat as deletion
+                            if rel.extension().is_none() {
+                                let is_tracked = self.stat_cache.lock()
+                                    .as_ref()
+                                    .is_some_and(|c| c.existed(&rel_str));
+                                if !is_tracked {
+                                    continue;
+                                }
+                            }
+                            self.remove_stat_cache(&rel_str);
+                            let msg = PeerMessage {
+                                source_name: self.name.clone(),
+                                group: self.group.clone(),
+                                event: ChangeEvent::Deleted {
+                                    path: rel.to_path_buf(),
+                                },
+                            };
+                            if hub_tx.send(msg).await.is_err() {
+                                return Ok(());
+                            }
+                        } else {
+                            // New path — treat as creation
+                            if self.write_tracker.is_own_write(event_path) {
+                                continue;
+                            }
+                            if event_path.is_dir() {
+                                continue;
+                            }
+                            match self.read_file(event_path, rel).await {
+                                Ok(Some(change_event)) => {
+                                    if let ChangeEvent::Modified {
+                                        ref path, mtime, ref data, ..
+                                    } = change_event
+                                    {
+                                        self.update_stat_cache(
+                                            &path.to_string_lossy(),
+                                            mtime,
+                                            data.len() as u64,
+                                        );
+                                    }
+                                    let msg = PeerMessage {
+                                        source_name: self.name.clone(),
+                                        group: self.group.clone(),
+                                        event: change_event,
+                                    };
+                                    if hub_tx.send(msg).await.is_err() {
+                                        return Ok(());
+                                    }
+                                }
+                                Ok(None) => {}
+                                Err(e) => {
+                                    tracing::warn!(
+                                        peer = %self.name, path = %rel_str,
+                                        "read error: {e}"
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    // Create, Modify (including RenameTo) — treat as upsert.
                     EventKind::Create(_) | EventKind::Modify(_) => {
+                        // Skip our own writes (only for create/modify, not remove)
+                        if self.write_tracker.is_own_write(event_path) {
+                            tracing::trace!(peer = %self.name, path = %rel_str, "skipping own write");
+                            continue;
+                        }
                         // Skip directories (stat is valid here since the file still exists)
                         if event_path.is_dir() {
                             continue;
@@ -190,10 +279,8 @@ impl StoragePeer {
                         }
                     }
                     EventKind::Remove(_) => {
-                        // For Remove events, the path no longer exists so is_dir()
-                        // would always return false. Use lack of extension as a
-                        // heuristic to skip directory removals, but check stat cache
-                        // to avoid ignoring tracked extension-less files.
+                        // Never suppress Remove with WriteTracker —
+                        // deletions must always propagate.
                         if rel.extension().is_none() {
                             let is_tracked = self.stat_cache.lock()
                                 .as_ref()
@@ -202,10 +289,7 @@ impl StoragePeer {
                                 continue;
                             }
                         }
-
-                        // Update stat cache
                         self.remove_stat_cache(&rel_str);
-
                         let msg = PeerMessage {
                             source_name: self.name.clone(),
                             group: self.group.clone(),
