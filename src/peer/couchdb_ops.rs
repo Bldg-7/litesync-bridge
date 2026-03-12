@@ -35,6 +35,7 @@ pub(crate) async fn upload_to_couchdb(
         tweaks.piece_size(),
         tweaks.minimum_chunk_size,
         e2ee,
+        &tweaks.hash_alg,
     )?;
 
     // Write chunks (content-addressed, idempotent — outside retry loop)

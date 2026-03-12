@@ -319,7 +319,7 @@ fn hash_passphrase_for_chunks(passphrase: &str) -> String {
 /// The returned ID uses the `h:+` prefix when E2EE is enabled (passphrase provided),
 /// or the `h:` prefix otherwise, matching the TS plugin's `HashManagerCore.computeHash`
 /// behavior where encrypted hashes include a `"+"` discriminator.
-pub fn chunk_id(piece: &str, passphrase: Option<&str>) -> String {
+pub fn chunk_id(piece: &str, passphrase: Option<&str>, hash_alg: &str) -> String {
     let piece_utf16_len: usize = piece.chars().map(|c| c.len_utf16()).sum();
 
     let (prefix, hash_input) = if let Some(pp) = passphrase {
@@ -329,8 +329,13 @@ pub fn chunk_id(piece: &str, passphrase: Option<&str>) -> String {
         (PREFIX_CHUNK, format!("{}-{}", piece, piece_utf16_len))
     };
 
-    let hash = xxhash_rust::xxh64::xxh64(hash_input.as_bytes(), 0);
-    format!("{}{}", prefix, u64_to_base36(hash))
+    if hash_alg == "xxhash32" {
+        let hash = xxhash_rust::xxh32::xxh32(hash_input.as_bytes(), 0);
+        format!("{}{}", prefix, u64_to_base36(hash as u64))
+    } else {
+        let hash = xxhash_rust::xxh64::xxh64(hash_input.as_bytes(), 0);
+        format!("{}{}", prefix, u64_to_base36(hash))
+    }
 }
 
 fn u64_to_base36(mut n: u64) -> String {
@@ -538,6 +543,7 @@ pub fn disassemble(
     piece_size: usize,
     min_chunk_size: usize,
     e2ee: Option<&E2EEContext>,
+    hash_alg: &str,
 ) -> anyhow::Result<DisassembleResult> {
     let passphrase_for_hash = e2ee.map(|ctx| ctx.passphrase.as_str());
 
@@ -560,7 +566,7 @@ pub fn disassemble(
     let mut seen_ids: HashMap<String, usize> = HashMap::new();
 
     for piece in &pieces {
-        let id = chunk_id(piece, passphrase_for_hash);
+        let id = chunk_id(piece, passphrase_for_hash, hash_alg);
 
         children.push(id.clone());
 
@@ -882,41 +888,41 @@ mod tests {
     #[test]
     fn test_chunk_id_without_passphrase() {
         let piece = "SGVsbG8="; // base64 "Hello"
-        let id = chunk_id(piece, None);
+        let id = chunk_id(piece, None, "xxhash64");
         assert!(id.starts_with("h:"));
         // Deterministic
-        assert_eq!(id, chunk_id(piece, None));
+        assert_eq!(id, chunk_id(piece, None, "xxhash64"));
     }
 
     #[test]
     fn test_chunk_id_with_passphrase() {
         let piece = "SGVsbG8=";
-        let id = chunk_id(piece, Some("my-passphrase"));
+        let id = chunk_id(piece, Some("my-passphrase"), "xxhash64");
         assert!(id.starts_with("h:+"), "E2EE chunk ID should start with 'h:+', got: {id}");
         // Different from without passphrase
-        assert_ne!(id, chunk_id(piece, None));
+        assert_ne!(id, chunk_id(piece, None, "xxhash64"));
     }
 
     #[test]
     fn test_chunk_id_different_content_different_id() {
-        let id1 = chunk_id("SGVsbG8=", None);
-        let id2 = chunk_id("V29ybGQ=", None);
+        let id1 = chunk_id("SGVsbG8=", None, "xxhash64");
+        let id2 = chunk_id("V29ybGQ=", None, "xxhash64");
         assert_ne!(id1, id2);
     }
 
     #[test]
     fn test_chunk_id_same_content_same_id() {
         // Content-addressed: same content → same ID
-        let id1 = chunk_id("SGVsbG8=", Some("pp"));
-        let id2 = chunk_id("SGVsbG8=", Some("pp"));
+        let id1 = chunk_id("SGVsbG8=", Some("pp"), "xxhash64");
+        let id2 = chunk_id("SGVsbG8=", Some("pp"), "xxhash64");
         assert_eq!(id1, id2);
     }
 
     #[test]
     fn test_chunk_id_different_passphrase_different_id() {
         let piece = "SGVsbG8=";
-        let id1 = chunk_id(piece, Some("completely-different-alpha"));
-        let id2 = chunk_id(piece, Some("something-else-entirely-beta"));
+        let id1 = chunk_id(piece, Some("completely-different-alpha"), "xxhash64");
+        let id2 = chunk_id(piece, Some("something-else-entirely-beta"), "xxhash64");
         assert_ne!(id1, id2);
     }
 
@@ -927,11 +933,11 @@ mod tests {
         // Without encryption, the result is "h:hash" (no "+").
         let piece = "test content for prefix check";
 
-        let plain_id = chunk_id(piece, None);
+        let plain_id = chunk_id(piece, None, "xxhash64");
         assert!(plain_id.starts_with("h:"), "plain chunk ID should start with 'h:'");
         assert!(!plain_id.starts_with("h:+"), "plain chunk ID must NOT have '+' discriminator");
 
-        let encrypted_id = chunk_id(piece, Some("my-passphrase"));
+        let encrypted_id = chunk_id(piece, Some("my-passphrase"), "xxhash64");
         assert!(encrypted_id.starts_with("h:+"), "encrypted chunk ID should start with 'h:+'");
 
         // The hash portion (after prefix) should be different since the
@@ -939,6 +945,31 @@ mod tests {
         let plain_hash = &plain_id[2..];
         let encrypted_hash = &encrypted_id[3..];
         assert_ne!(plain_hash, encrypted_hash);
+    }
+
+    #[test]
+    fn test_chunk_id_xxhash32() {
+        let piece = "SGVsbG8=";
+        let id32 = chunk_id(piece, None, "xxhash32");
+        let id64 = chunk_id(piece, None, "xxhash64");
+        // Both use "h:" prefix but different hashes
+        assert!(id32.starts_with("h:"));
+        assert_ne!(id32, id64, "xxhash32 and xxhash64 should produce different IDs");
+    }
+
+    #[test]
+    fn test_chunk_id_xxhash32_deterministic() {
+        let piece = "test content";
+        let id1 = chunk_id(piece, None, "xxhash32");
+        let id2 = chunk_id(piece, None, "xxhash32");
+        assert_eq!(id1, id2);
+    }
+
+    #[test]
+    fn test_chunk_id_xxhash32_with_passphrase() {
+        let piece = "SGVsbG8=";
+        let id = chunk_id(piece, Some("my-passphrase"), "xxhash32");
+        assert!(id.starts_with("h:+"), "E2EE xxhash32 chunk ID should start with 'h:+'");
     }
 
     // =====================================================================
@@ -1245,7 +1276,7 @@ mod tests {
 
     #[test]
     fn test_disassemble_empty_content() {
-        let result = disassemble(b"", "test.md", 1000, 20, None).unwrap();
+        let result = disassemble(b"", "test.md", 1000, 20, None, "xxhash64").unwrap();
         assert!(result.chunks.is_empty());
         assert!(result.children.is_empty());
     }
@@ -1253,7 +1284,7 @@ mod tests {
     #[test]
     fn test_disassemble_text_basic() {
         let content = b"# Hello\n\nWorld\n";
-        let result = disassemble(content, "test.md", 1000, 20, None).unwrap();
+        let result = disassemble(content, "test.md", 1000, 20, None, "xxhash64").unwrap();
         assert!(!result.chunks.is_empty());
         assert_eq!(result.chunks.len(), result.children.len());
 
@@ -1283,7 +1314,7 @@ mod tests {
     #[test]
     fn test_disassemble_binary() {
         let content: Vec<u8> = (0..500).map(|i| (i % 256) as u8).collect();
-        let result = disassemble(&content, "image.png", 1000, 20, None).unwrap();
+        let result = disassemble(&content, "image.png", 1000, 20, None, "xxhash64").unwrap();
         assert!(!result.chunks.is_empty());
 
         let reconstructed: Vec<u8> = result.children.iter()
@@ -1300,7 +1331,7 @@ mod tests {
     fn test_disassemble_content_dedup() {
         // Repeated lines → same chunks should be deduped
         let content = "repeated line\nrepeated line\nrepeated line\n";
-        let result = disassemble(content.as_bytes(), "test.md", 5, 20, None).unwrap();
+        let result = disassemble(content.as_bytes(), "test.md", 5, 20, None, "xxhash64").unwrap();
         // children may have duplicate IDs, but chunks should be unique
         let unique_ids: std::collections::HashSet<&str> =
             result.chunks.iter().map(|c| c._id.as_str()).collect();
@@ -1311,7 +1342,7 @@ mod tests {
     fn test_disassemble_with_e2ee() {
         let ctx = test_ctx();
         let content = b"# Secret Note\n\nThis is encrypted.\n";
-        let result = disassemble(content, "secret.md", 1000, 20, Some(&ctx)).unwrap();
+        let result = disassemble(content, "secret.md", 1000, 20, Some(&ctx), "xxhash64").unwrap();
 
         // All chunk IDs should use the encrypted prefix "h:+"
         for child in &result.children {
@@ -1341,8 +1372,8 @@ mod tests {
     fn test_disassemble_deterministic_ids() {
         // Same content + same passphrase → same chunk IDs
         let content = b"deterministic test";
-        let r1 = disassemble(content, "test.md", 1000, 20, None).unwrap();
-        let r2 = disassemble(content, "test.md", 1000, 20, None).unwrap();
+        let r1 = disassemble(content, "test.md", 1000, 20, None, "xxhash64").unwrap();
+        let r2 = disassemble(content, "test.md", 1000, 20, None, "xxhash64").unwrap();
         assert_eq!(r1.children, r2.children);
     }
 
@@ -1355,7 +1386,7 @@ mod tests {
 
         for ext in &["css", "js", "html", "svg", "csv", "xml"] {
             let filename = format!("test.{ext}");
-            let result = disassemble(content, &filename, 1000, 20, None).unwrap();
+            let result = disassemble(content, &filename, 1000, 20, None, "xxhash64").unwrap();
             assert!(!result.chunks.is_empty(), "{filename} should produce chunks");
 
             // Binary-split chunks are base64-encoded. Verify each chunk decodes
@@ -1386,7 +1417,7 @@ mod tests {
 
         for ext in &["md", "txt", "canvas"] {
             let filename = format!("test.{ext}");
-            let result = disassemble(content, &filename, 1000, 20, None).unwrap();
+            let result = disassemble(content, &filename, 1000, 20, None, "xxhash64").unwrap();
             assert!(!result.chunks.is_empty(), "{filename} should produce chunks");
 
             // Text-split chunks are raw text, not base64.
