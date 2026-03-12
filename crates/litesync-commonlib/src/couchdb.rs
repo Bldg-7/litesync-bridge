@@ -93,7 +93,6 @@ impl CouchDBClient {
 
         let client = Client::builder()
             .connect_timeout(Duration::from_secs(10))
-            .timeout(Duration::from_secs(30))
             .danger_accept_invalid_certs(false)
             .default_headers(default_headers)
             .build()?;
@@ -114,7 +113,9 @@ impl CouchDBClient {
     /// Fetch a single document by ID.
     pub async fn get_doc<T: DeserializeOwned>(&self, id: &str) -> anyhow::Result<T> {
         let url = format!("{}/{}", self.db_url(), urlencoding::encode(id));
-        let resp = self.client.get(&url).send().await?;
+        let resp = self.client.get(&url)
+            .timeout(Duration::from_secs(30))
+            .send().await?;
 
         if !resp.status().is_success() {
             let status = resp.status();
@@ -157,6 +158,7 @@ impl CouchDBClient {
             .client
             .post(&url)
             .query(&[("since", since)])
+            .timeout(Duration::from_secs(300))
             .json(&body)
             .send()
             .await?;
@@ -179,7 +181,9 @@ impl CouchDBClient {
         let url = format!("{}/_all_docs?include_docs=true", self.db_url());
         let body = json!({ "keys": chunk_ids });
 
-        let resp = self.client.post(&url).json(&body).send().await?;
+        let resp = self.client.post(&url)
+            .timeout(Duration::from_secs(60))
+            .json(&body).send().await?;
 
         if !resp.status().is_success() {
             let status = resp.status();
@@ -264,7 +268,9 @@ impl CouchDBClient {
         {
             let config_id = "_local/obsidian_livesync_sync_parameters";
             let url = format!("{}/{}", self.db_url(), urlencoding::encode(config_id));
-            let resp = self.client.get(&url).send().await?;
+            let resp = self.client.get(&url)
+                .timeout(Duration::from_secs(15))
+                .send().await?;
             if resp.status().is_success() {
                 let doc: serde_json::Value = resp.json().await?;
                 if let Some(salt_b64) = doc.get("pbkdf2salt").and_then(|v| v.as_str()) {
@@ -284,7 +290,9 @@ impl CouchDBClient {
 
         for config_id in &legacy_ids {
             let url = format!("{}/{}", self.db_url(), urlencoding::encode(config_id));
-            let resp = self.client.get(&url).send().await?;
+            let resp = self.client.get(&url)
+                .timeout(Duration::from_secs(15))
+                .send().await?;
             if !resp.status().is_success() {
                 continue;
             }
@@ -312,7 +320,9 @@ impl CouchDBClient {
             self.db_url(),
             urlencoding::encode(MILESTONE_DOCID)
         );
-        let resp = self.client.get(&url).send().await?;
+        let resp = self.client.get(&url)
+            .timeout(Duration::from_secs(15))
+            .send().await?;
 
         if !resp.status().is_success() {
             // Document doesn't exist (404) or other error — use defaults
@@ -396,7 +406,9 @@ impl CouchDBClient {
     /// Test the connection to CouchDB.
     pub async fn ping(&self) -> anyhow::Result<()> {
         let url = self.db_url();
-        let resp = self.client.get(&url).send().await?;
+        let resp = self.client.get(&url)
+            .timeout(Duration::from_secs(15))
+            .send().await?;
         if !resp.status().is_success() {
             let status = resp.status();
             anyhow::bail!("CouchDB ping failed: {status}");
@@ -418,7 +430,9 @@ impl CouchDBClient {
         doc: &T,
     ) -> anyhow::Result<PutResponse> {
         let url = format!("{}/{}", self.db_url(), urlencoding::encode(id));
-        let resp = self.client.put(&url).json(doc).send().await?;
+        let resp = self.client.put(&url)
+            .timeout(Duration::from_secs(30))
+            .json(doc).send().await?;
 
         if !resp.status().is_success() {
             let status = resp.status();
@@ -446,7 +460,9 @@ impl CouchDBClient {
         let url = format!("{}/_bulk_docs", self.db_url());
         let body = json!({ "docs": chunks });
 
-        let resp = self.client.post(&url).json(&body).send().await?;
+        let resp = self.client.post(&url)
+            .timeout(Duration::from_secs(60))
+            .json(&body).send().await?;
 
         if !resp.status().is_success() {
             let status = resp.status();
@@ -482,6 +498,7 @@ impl CouchDBClient {
             .client
             .delete(&url)
             .query(&[("rev", rev)])
+            .timeout(Duration::from_secs(30))
             .send()
             .await?;
 

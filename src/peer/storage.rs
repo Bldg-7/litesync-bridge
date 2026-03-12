@@ -184,9 +184,15 @@ impl StoragePeer {
                     EventKind::Remove(_) => {
                         // For Remove events, the path no longer exists so is_dir()
                         // would always return false. Use lack of extension as a
-                        // heuristic to skip directory removals.
+                        // heuristic to skip directory removals, but check stat cache
+                        // to avoid ignoring tracked extension-less files.
                         if rel.extension().is_none() {
-                            continue;
+                            let is_tracked = self.stat_cache.lock()
+                                .as_ref()
+                                .is_some_and(|c| c.existed(&rel_str));
+                            if !is_tracked {
+                                continue;
+                            }
                         }
 
                         // Update stat cache
@@ -277,6 +283,9 @@ impl StoragePeer {
                 tracing::warn!(peer = %self.name, "file write failed: {e}");
             }
         }
+
+        // Save stat cache on shutdown (inbound loop)
+        self.save_stat_cache().await;
 
         tracing::info!(peer = %self.name, "inbound loop stopped");
         Ok(())

@@ -569,11 +569,7 @@ impl CouchDBPeer {
                             return Ok(());
                         }
                         Err(e) => {
-                            tracing::debug!(
-                                peer = %self.name, path = %filename,
-                                "doc not found for delete: {e}"
-                            );
-                            return Ok(());
+                            return Err(e);
                         }
                     };
 

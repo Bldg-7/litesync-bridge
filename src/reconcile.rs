@@ -830,11 +830,14 @@ impl InitializedPeer {
 }
 
 /// Reconcile all CouchDB↔Storage peer pairs in the same group.
+///
+/// Returns an error if any peer pair reconciliation fails.
 pub async fn reconcile_all(
     peers: &mut [InitializedPeer],
     data_dir: &Path,
     cancel: &CancellationToken,
 ) -> anyhow::Result<()> {
+    let mut had_errors = false;
     // Collect (couch_idx, storage_idx, group) pairs to reconcile.
     let mut pairs: Vec<(usize, usize, String)> = Vec::new();
 
@@ -919,7 +922,12 @@ pub async fn reconcile_all(
                 storage = %storage_name,
                 "reconciliation failed: {e}"
             );
+            had_errors = true;
         }
+    }
+
+    if had_errors {
+        anyhow::bail!("one or more reconciliation pairs failed");
     }
 
     Ok(())
