@@ -1,0 +1,16 @@
+[Unit]
+Description=LiteSync Bridge - CouchDB <-> filesystem sync daemon
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/livesync-bridge
+ExecStart=/usr/local/bin/litesync-bridge --config dat/config.json
+Restart=on-failure
+RestartSec=10
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target
