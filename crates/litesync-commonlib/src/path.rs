@@ -6,16 +6,29 @@ use crate::doc::PREFIX_OBFUSCATED;
 ///
 /// If `obfuscate_passphrase` is provided, the path is hashed using SHA-256
 /// with a passphrase-derived key (iterated SHA-256).
-pub fn path2id(path: &str, obfuscate_passphrase: Option<&str>) -> String {
+///
+/// When `case_sensitive` is `false` (the default matching the TS plugin), the
+/// path is lowercased before any ID generation.  This matches the TS
+/// `path2id_base(filename, obfuscatePassphrase, caseInsensitive)` where
+/// `caseInsensitive = !handleFilenameCaseSensitive` (default `true`).
+pub fn path2id(path: &str, obfuscate_passphrase: Option<&str>, case_sensitive: bool) -> String {
     if path.starts_with(PREFIX_OBFUSCATED) {
         return path.to_string();
     }
+
+    // TS: if (caseInsensitive) filename = filename.toLowerCase();
+    // Our `case_sensitive` param is the inverse of TS `caseInsensitive`.
+    let path = if case_sensitive {
+        path.to_string()
+    } else {
+        path.to_lowercase()
+    };
 
     // Paths starting with "_" get a "/" prefix to avoid CouchDB reserved IDs.
     let normalized = if path.starts_with('_') {
         format!("/{path}")
     } else {
-        path.to_string()
+        path.clone()
     };
 
     let Some(passphrase) = obfuscate_passphrase else {
@@ -29,7 +42,7 @@ pub fn path2id(path: &str, obfuscate_passphrase: Option<&str>) -> String {
     }
 
     let hashed_passphrase = hash_string_chain(passphrase);
-    // TS path2id_base hashes `filename` (original path), not `x` (escaped).
+    // TS path2id_base hashes `filename` (the possibly-lowered path), not `x` (escaped).
     // The "/" prefix is only for non-obfuscated CouchDB reserved ID avoidance;
     // obfuscated IDs start with "f:" so no collision is possible.
     let id_hash = sha256_hex(&format!("{hashed_passphrase}:{path}"));
@@ -136,127 +149,176 @@ mod tests {
     //
     // TS path2id_base (line 121-123):
     //   hashedPassphrase = SHA-256(passphrase)   // _hashString loop is no-op
-    //   out = SHA-256(`${hashedPassphrase}:${filename}`)  // filename = ORIGINAL
+    //   out = SHA-256(`${hashedPassphrase}:${filename}`)  // filename = possibly lowered
     //   return prefix + "f:" + out
     // =====================================================================
-    fn ts_expected_obfuscated_id(path: &str, passphrase: &str) -> String {
-        // TS uses the escaped `x` for prefix splitting, but `filename` (original) for hashing.
+    fn ts_expected_obfuscated_id(path: &str, passphrase: &str, case_sensitive: bool) -> String {
+        // Apply case insensitivity first, matching TS behavior
+        let filename = if case_sensitive {
+            path.to_string()
+        } else {
+            path.to_lowercase()
+        };
+
+        // TS uses the escaped `x` for prefix splitting, but `filename` (possibly lowered) for hashing.
         let hashed_pp = sha256_hex(passphrase);
 
         // TS line 111: underscore escape applied to `x`, not `filename`.
-        let x = if path.starts_with('_') {
-            format!("/{path}")
+        let x = if filename.starts_with('_') {
+            format!("/{filename}")
         } else {
-            path.to_string()
+            filename.clone()
         };
 
         // TS line 118: prefix split from `x` (escaped).
         let (prefix, _body) = split_prefix(&x);
 
-        // TS line 123: hash computed from `filename` (ORIGINAL path, not `x`).
-        let id_hash = sha256_hex(&format!("{hashed_pp}:{path}"));
+        // TS line 123: hash computed from `filename` (possibly lowered path, not `x`).
+        let id_hash = sha256_hex(&format!("{hashed_pp}:{filename}"));
 
         format!("{prefix}f:{id_hash}")
     }
 
     // =====================================================================
-    // path2id — no obfuscation
+    // path2id — no obfuscation, case-sensitive (preserves original case)
     // =====================================================================
 
     #[test]
-    fn test_path2id_no_obfuscation() {
-        assert_eq!(path2id("notes/hello.md", None), "notes/hello.md");
+    fn test_path2id_no_obfuscation_case_sensitive() {
+        assert_eq!(path2id("notes/hello.md", None, true), "notes/hello.md");
     }
 
     #[test]
-    fn test_path2id_no_obfuscation_underscore_escape() {
+    fn test_path2id_no_obfuscation_underscore_escape_case_sensitive() {
         // CouchDB reserves "_"-prefixed IDs; "/" prefix avoids collision.
-        assert_eq!(path2id("_design/doc", None), "/_design/doc");
-        assert_eq!(path2id("_notes/secret.md", None), "/_notes/secret.md");
+        assert_eq!(path2id("_design/doc", None, true), "/_design/doc");
+        assert_eq!(path2id("_notes/secret.md", None, true), "/_notes/secret.md");
     }
 
     #[test]
-    fn test_path2id_no_obfuscation_prefixed_underscore() {
+    fn test_path2id_no_obfuscation_prefixed_underscore_case_sensitive() {
         // Prefixed path: body starts with "_" but full path starts with "ps:",
         // so no CouchDB collision — no "/" escape needed.
         // TS behavior: x.startsWith("_") is false → no escape.
-        assert_eq!(path2id("ps:_design/doc", None), "ps:_design/doc");
+        assert_eq!(path2id("ps:_design/doc", None, true), "ps:_design/doc");
     }
 
     #[test]
     fn test_path2id_no_obfuscation_already_obfuscated() {
-        // Already obfuscated — pass through.
-        assert_eq!(path2id("f:abc123", None), "f:abc123");
+        // Already obfuscated — pass through (case_sensitive doesn't matter).
+        assert_eq!(path2id("f:abc123", None, true), "f:abc123");
+        assert_eq!(path2id("f:abc123", None, false), "f:abc123");
     }
 
     // =====================================================================
-    // path2id — with obfuscation
+    // path2id — no obfuscation, case-insensitive (default TS behavior)
     // =====================================================================
 
     #[test]
-    fn test_path2id_obfuscation_normal() {
-        let pp = "my_passphrase";
-        let expected = ts_expected_obfuscated_id("notes/hello.md", pp);
-        assert_eq!(path2id("notes/hello.md", Some(pp)), expected);
+    fn test_path2id_no_obfuscation_case_insensitive() {
+        // Default TS behavior: paths are lowercased
+        assert_eq!(path2id("Notes/Hello.md", None, false), "notes/hello.md");
+        assert_eq!(path2id("notes/hello.md", None, false), "notes/hello.md");
     }
 
     #[test]
-    fn test_path2id_obfuscation_underscore() {
-        // KEY TEST: TS hashes the ORIGINAL path ("_design/doc"), not the
-        // escaped form ("/_design/doc"). The "/" prefix is only for
-        // non-obfuscated CouchDB ID collision avoidance; obfuscated IDs
-        // already start with "f:" so no collision is possible.
-        let pp = "my_passphrase";
-        let expected = ts_expected_obfuscated_id("_design/doc", pp);
-        assert_eq!(path2id("_design/doc", Some(pp)), expected);
+    fn test_path2id_no_obfuscation_underscore_case_insensitive() {
+        assert_eq!(path2id("_Design/Doc", None, false), "/_design/doc");
     }
 
     #[test]
-    fn test_path2id_obfuscation_prefixed() {
-        // Prefix should be preserved: "ps:" + "f:" + hash.
+    fn test_path2id_no_obfuscation_prefixed_case_insensitive() {
+        // Prefix is also lowercased (TS lowercases the entire filename string)
+        assert_eq!(path2id("PS:Notes/Hello.md", None, false), "ps:notes/hello.md");
+    }
+
+    // =====================================================================
+    // path2id — with obfuscation, case-sensitive
+    // =====================================================================
+
+    #[test]
+    fn test_path2id_obfuscation_normal_case_sensitive() {
         let pp = "my_passphrase";
-        let expected = ts_expected_obfuscated_id("ps:notes/hello.md", pp);
-        assert_eq!(path2id("ps:notes/hello.md", Some(pp)), expected);
+        let expected = ts_expected_obfuscated_id("notes/hello.md", pp, true);
+        assert_eq!(path2id("notes/hello.md", Some(pp), true), expected);
+    }
+
+    #[test]
+    fn test_path2id_obfuscation_underscore_case_sensitive() {
+        let pp = "my_passphrase";
+        let expected = ts_expected_obfuscated_id("_design/doc", pp, true);
+        assert_eq!(path2id("_design/doc", Some(pp), true), expected);
+    }
+
+    #[test]
+    fn test_path2id_obfuscation_prefixed_case_sensitive() {
+        let pp = "my_passphrase";
+        let expected = ts_expected_obfuscated_id("ps:notes/hello.md", pp, true);
+        assert_eq!(path2id("ps:notes/hello.md", Some(pp), true), expected);
         assert!(expected.starts_with("ps:f:"));
     }
 
     #[test]
-    fn test_path2id_obfuscation_prefixed_underscore() {
-        // "ps:_design/doc" — no underscore escape (starts with "ps:", not "_").
-        // x === filename, so hash input is the same either way.
+    fn test_path2id_obfuscation_prefixed_underscore_case_sensitive() {
         let pp = "my_passphrase";
-        let expected = ts_expected_obfuscated_id("ps:_design/doc", pp);
-        assert_eq!(path2id("ps:_design/doc", Some(pp)), expected);
+        let expected = ts_expected_obfuscated_id("ps:_design/doc", pp, true);
+        assert_eq!(path2id("ps:_design/doc", Some(pp), true), expected);
         assert!(expected.starts_with("ps:f:"));
     }
 
     #[test]
     fn test_path2id_obfuscation_already_obfuscated_passthrough() {
-        assert_eq!(path2id("f:abc123", Some("pp")), "f:abc123");
+        assert_eq!(path2id("f:abc123", Some("pp"), true), "f:abc123");
+        assert_eq!(path2id("f:abc123", Some("pp"), false), "f:abc123");
     }
 
     #[test]
     fn test_path2id_obfuscation_body_already_obfuscated_passthrough() {
-        // "ps:f:abc123" — body starts with "f:", pass through.
-        let normalized = path2id("ps:f:abc123", Some("pp"));
+        let normalized = path2id("ps:f:abc123", Some("pp"), true);
         assert_eq!(normalized, "ps:f:abc123");
     }
 
     // =====================================================================
-    // path2id / id2path roundtrip (non-obfuscated)
+    // path2id — with obfuscation, case-insensitive (default TS behavior)
+    // =====================================================================
+
+    #[test]
+    fn test_path2id_obfuscation_case_insensitive() {
+        let pp = "my_passphrase";
+        // Mixed-case path should produce same ID as all-lowercase
+        let id_mixed = path2id("Notes/Hello.md", Some(pp), false);
+        let id_lower = path2id("notes/hello.md", Some(pp), false);
+        assert_eq!(id_mixed, id_lower);
+
+        // Should match the TS expected value (which lowercases first)
+        let expected = ts_expected_obfuscated_id("Notes/Hello.md", pp, false);
+        assert_eq!(id_mixed, expected);
+    }
+
+    #[test]
+    fn test_path2id_obfuscation_case_sensitive_differs() {
+        let pp = "my_passphrase";
+        // Case-sensitive should produce DIFFERENT IDs for different cases
+        let id_mixed = path2id("Notes/Hello.md", Some(pp), true);
+        let id_lower = path2id("notes/hello.md", Some(pp), true);
+        assert_ne!(id_mixed, id_lower);
+    }
+
+    // =====================================================================
+    // path2id / id2path roundtrip (non-obfuscated, case-sensitive)
     // =====================================================================
 
     #[test]
     fn test_roundtrip_normal() {
         let path = "notes/hello.md";
-        let id = path2id(path, None);
+        let id = path2id(path, None, true);
         assert_eq!(id2path(&id, None).unwrap(), path);
     }
 
     #[test]
     fn test_roundtrip_underscore() {
         let path = "_design/doc";
-        let id = path2id(path, None);
+        let id = path2id(path, None, true);
         // id = "/_design/doc", id2path strips the "/"
         assert_eq!(id2path(&id, None).unwrap(), path);
     }
@@ -264,7 +326,7 @@ mod tests {
     #[test]
     fn test_roundtrip_prefixed() {
         let path = "ps:notes/hello.md";
-        let id = path2id(path, None);
+        let id = path2id(path, None, true);
         assert_eq!(id2path(&id, None).unwrap(), path);
     }
 
@@ -272,8 +334,20 @@ mod tests {
     fn test_roundtrip_prefixed_underscore() {
         // "ps:_design/doc" has no escape applied, roundtrips directly.
         let path = "ps:_design/doc";
-        let id = path2id(path, None);
+        let id = path2id(path, None, true);
         assert_eq!(id2path(&id, None).unwrap(), path);
+    }
+
+    // =====================================================================
+    // path2id / id2path roundtrip (non-obfuscated, case-insensitive)
+    // =====================================================================
+
+    #[test]
+    fn test_roundtrip_case_insensitive() {
+        // Case-insensitive: path2id lowercases, id2path returns the lowered form
+        let id = path2id("Notes/Hello.md", None, false);
+        assert_eq!(id, "notes/hello.md");
+        assert_eq!(id2path(&id, None).unwrap(), "notes/hello.md");
     }
 
     // =====================================================================

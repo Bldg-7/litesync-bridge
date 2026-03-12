@@ -7,7 +7,7 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use litesync_commonlib::chunk::{self, E2EEContext};
-use litesync_commonlib::couchdb::{CouchDBClient, CouchDBHttpError};
+use litesync_commonlib::couchdb::{CouchDBClient, CouchDBHttpError, RemoteTweaks};
 use litesync_commonlib::crypto;
 use litesync_commonlib::doc::{RawNoteEntry, TYPE_NEWNOTE, TYPE_PLAIN};
 use litesync_commonlib::path;
@@ -17,7 +17,6 @@ use crate::config::CouchDBPeerConfig;
 use crate::state::{PathCache, RevTracker, SinceTracker};
 
 const LONGPOLL_TIMEOUT_MS: u64 = 30_000;
-pub(crate) const DEFAULT_PIECE_SIZE: usize = 250_000;
 pub(crate) const MAX_CONFLICT_RETRIES: u32 = 3;
 
 pub(crate) fn is_conflict(err: &anyhow::Error) -> bool {
@@ -41,8 +40,10 @@ pub struct CouchDBPeer {
     group: Arc<str>,
     base_dir: String,
     obfuscate_passphrase: Option<String>,
+    case_sensitive: bool,
     client: CouchDBClient,
     e2ee: Option<E2EEContext>,
+    tweaks: RemoteTweaks,
     rev_tracker: Arc<RevTracker>,
     path_cache: Arc<PathCache>,
 }
@@ -71,6 +72,17 @@ impl CouchDBPeer {
             None
         };
 
+        // Fetch remote tweaks (chunk size, min chunk size, hash alg, etc.)
+        let tweaks = client.get_remote_tweaks().await?;
+        tracing::info!(
+            peer = %config.name,
+            piece_size = tweaks.piece_size(),
+            min_chunk_size = tweaks.minimum_chunk_size,
+            hash_alg = %tweaks.hash_alg,
+            case_sensitive = tweaks.handle_filename_case_sensitive,
+            "remote tweaks loaded"
+        );
+
         let since = SinceTracker::load(data_dir, &config.name);
         tracing::info!(peer = %config.name, since = %since.get(), "loaded since sequence");
 
@@ -82,13 +94,17 @@ impl CouchDBPeer {
             format!("{}/", config.base_dir)
         };
 
+        let case_sensitive = tweaks.handle_filename_case_sensitive;
+
         let peer = Self {
             name: Arc::from(config.name),
             group: Arc::from(config.group),
             base_dir,
             obfuscate_passphrase: config.obfuscate_passphrase,
+            case_sensitive,
             client,
             e2ee,
+            tweaks,
             rev_tracker: Arc::new(RevTracker::new()),
             path_cache: Arc::new(PathCache::new()),
         };
@@ -128,6 +144,10 @@ impl CouchDBPeer {
 
     pub(crate) fn path_cache(&self) -> &Arc<PathCache> {
         &self.path_cache
+    }
+
+    pub(crate) fn tweaks(&self) -> &RemoteTweaks {
+        &self.tweaks
     }
 
     /// Spawn outbound (changes feed) and inbound (write) tasks.
@@ -413,13 +433,14 @@ impl CouchDBPeer {
                 };
 
                 let doc_id =
-                    path::path2id(&full_path, self.obfuscate_passphrase.as_deref());
+                    path::path2id(&full_path, self.obfuscate_passphrase.as_deref(), self.case_sensitive);
 
-                // Split content into chunks
+                // Split content into chunks using remote tweak values
                 let result = chunk::disassemble(
                     &data,
                     &filename,
-                    DEFAULT_PIECE_SIZE,
+                    self.tweaks.piece_size(),
+                    self.tweaks.minimum_chunk_size,
                     self.e2ee.as_ref(),
                 )?;
 
@@ -518,7 +539,7 @@ impl CouchDBPeer {
                 };
 
                 let doc_id =
-                    path::path2id(&full_path, self.obfuscate_passphrase.as_deref());
+                    path::path2id(&full_path, self.obfuscate_passphrase.as_deref(), self.case_sensitive);
 
                 for attempt in 0..MAX_CONFLICT_RETRIES {
                     // Fetch current _rev (required for CouchDB delete)

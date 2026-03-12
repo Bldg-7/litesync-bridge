@@ -512,20 +512,29 @@ pub struct DisassembleResult {
 /// Text files produce raw text chunks; binary files produce base64 chunks.
 /// If E2EE is enabled, each chunk's data is encrypted before storage.
 /// The returned `children` list contains the chunk IDs in order.
+///
+/// `min_chunk_size` controls the minimum text chunk size (default: 20 in the
+/// Obsidian plugin). This value is fetched from the remote milestone document's
+/// `minimumChunkSize` tweak.
 pub fn disassemble(
     content: &[u8],
     filename: &str,
     piece_size: usize,
+    min_chunk_size: usize,
     e2ee: Option<&E2EEContext>,
 ) -> anyhow::Result<DisassembleResult> {
     let passphrase_for_hash = e2ee.map(|ctx| ctx.passphrase.as_str());
 
     // Text files: raw text pieces; Binary files: base64 pieces
-    let is_text = path::is_plain_text(filename);
+    // Use should_split_as_plain_text (md, txt, canvas) — NOT is_plain_text —
+    // to match the TS plugin's shouldSplitAsPlainText() split decision.
+    // is_plain_text covers more extensions (css, js, html, svg, csv, xml) and
+    // is used elsewhere for doc type determination, not for splitting.
+    let is_text = path::should_split_as_plain_text(filename);
     let pieces = if is_text {
         let text = std::str::from_utf8(content)
             .map_err(|e| anyhow::anyhow!("invalid UTF-8 for text file: {e}"))?;
-        split_text(text, piece_size, 250)
+        split_text(text, piece_size, min_chunk_size)
     } else {
         split_binary(content, piece_size, filename)
     };
@@ -1034,7 +1043,7 @@ mod tests {
 
     #[test]
     fn test_disassemble_empty_content() {
-        let result = disassemble(b"", "test.md", 1000, None).unwrap();
+        let result = disassemble(b"", "test.md", 1000, 20, None).unwrap();
         assert!(result.chunks.is_empty());
         assert!(result.children.is_empty());
     }
@@ -1042,7 +1051,7 @@ mod tests {
     #[test]
     fn test_disassemble_text_basic() {
         let content = b"# Hello\n\nWorld\n";
-        let result = disassemble(content, "test.md", 1000, None).unwrap();
+        let result = disassemble(content, "test.md", 1000, 20, None).unwrap();
         assert!(!result.chunks.is_empty());
         assert_eq!(result.chunks.len(), result.children.len());
 
@@ -1072,7 +1081,7 @@ mod tests {
     #[test]
     fn test_disassemble_binary() {
         let content: Vec<u8> = (0..500).map(|i| (i % 256) as u8).collect();
-        let result = disassemble(&content, "image.png", 1000, None).unwrap();
+        let result = disassemble(&content, "image.png", 1000, 20, None).unwrap();
         assert!(!result.chunks.is_empty());
 
         let reconstructed: Vec<u8> = result.children.iter()
@@ -1089,7 +1098,7 @@ mod tests {
     fn test_disassemble_content_dedup() {
         // Repeated lines → same chunks should be deduped
         let content = "repeated line\nrepeated line\nrepeated line\n";
-        let result = disassemble(content.as_bytes(), "test.md", 5, None).unwrap();
+        let result = disassemble(content.as_bytes(), "test.md", 5, 20, None).unwrap();
         // children may have duplicate IDs, but chunks should be unique
         let unique_ids: std::collections::HashSet<&str> =
             result.chunks.iter().map(|c| c._id.as_str()).collect();
@@ -1100,7 +1109,7 @@ mod tests {
     fn test_disassemble_with_e2ee() {
         let ctx = test_ctx();
         let content = b"# Secret Note\n\nThis is encrypted.\n";
-        let result = disassemble(content, "secret.md", 1000, Some(&ctx)).unwrap();
+        let result = disassemble(content, "secret.md", 1000, 20, Some(&ctx)).unwrap();
 
         // All chunk IDs should use the encrypted prefix "h:+"
         for child in &result.children {
@@ -1130,8 +1139,67 @@ mod tests {
     fn test_disassemble_deterministic_ids() {
         // Same content + same passphrase → same chunk IDs
         let content = b"deterministic test";
-        let r1 = disassemble(content, "test.md", 1000, None).unwrap();
-        let r2 = disassemble(content, "test.md", 1000, None).unwrap();
+        let r1 = disassemble(content, "test.md", 1000, 20, None).unwrap();
+        let r2 = disassemble(content, "test.md", 1000, 20, None).unwrap();
         assert_eq!(r1.children, r2.children);
+    }
+
+    #[test]
+    fn test_disassemble_css_js_html_use_binary_splitting() {
+        // H5 fix: CSS, JS, HTML, SVG, CSV, XML must use binary splitting
+        // (matching the TS plugin's shouldSplitAsPlainText), not text splitting.
+        // Only md, txt, canvas use text splitting.
+        let content = b"body { color: red; }\n.foo { display: block; }\n";
+
+        for ext in &["css", "js", "html", "svg", "csv", "xml"] {
+            let filename = format!("test.{ext}");
+            let result = disassemble(content, &filename, 1000, 20, None).unwrap();
+            assert!(!result.chunks.is_empty(), "{filename} should produce chunks");
+
+            // Binary-split chunks are base64-encoded. Verify each chunk decodes
+            // from base64 (text chunks would be raw text, not valid base64).
+            for chunk in &result.chunks {
+                assert!(
+                    BASE64.decode(&chunk.data).is_ok(),
+                    "{filename}: chunk data should be base64 (binary split), got raw text"
+                );
+            }
+
+            // Roundtrip: decode base64 chunks and verify content matches
+            let reconstructed: Vec<u8> = result.children.iter()
+                .map(|id| {
+                    let chunk = result.chunks.iter().find(|c| &c._id == id).unwrap();
+                    BASE64.decode(&chunk.data).unwrap()
+                })
+                .flatten()
+                .collect();
+            assert_eq!(reconstructed, content, "{filename}: binary roundtrip failed");
+        }
+    }
+
+    #[test]
+    fn test_disassemble_md_txt_canvas_use_text_splitting() {
+        // Counterpart: md, txt, canvas should still use text splitting.
+        let content = b"# Hello World\n\nSome text.\n";
+
+        for ext in &["md", "txt", "canvas"] {
+            let filename = format!("test.{ext}");
+            let result = disassemble(content, &filename, 1000, 20, None).unwrap();
+            assert!(!result.chunks.is_empty(), "{filename} should produce chunks");
+
+            // Text-split chunks are raw text, not base64.
+            // Concatenation of raw chunk data should equal original content.
+            let reconstructed: String = result.children.iter()
+                .map(|id| {
+                    let chunk = result.chunks.iter().find(|c| &c._id == id).unwrap();
+                    chunk.data.clone()
+                })
+                .collect();
+            assert_eq!(
+                reconstructed,
+                std::str::from_utf8(content).unwrap(),
+                "{filename}: text roundtrip failed"
+            );
+        }
     }
 }

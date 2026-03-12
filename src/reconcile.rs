@@ -6,12 +6,12 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tokio_util::sync::CancellationToken;
 
 use litesync_commonlib::chunk::{self, E2EEContext};
-use litesync_commonlib::couchdb::CouchDBClient;
+use litesync_commonlib::couchdb::{CouchDBClient, RemoteTweaks};
 use litesync_commonlib::doc::{RawNoteEntry, TYPE_NEWNOTE, TYPE_PLAIN};
 use litesync_commonlib::path;
 
 use crate::peer::couchdb::{
-    is_conflict, is_hidden_path, is_not_found, CouchDBPeer, DEFAULT_PIECE_SIZE,
+    is_conflict, is_hidden_path, is_not_found, CouchDBPeer,
     MAX_CONFLICT_RETRIES,
 };
 use crate::peer::storage::StoragePeer;
@@ -389,6 +389,7 @@ async fn reconcile(
     e2ee: Option<&E2EEContext>,
     base_dir_prefix: &str,
     obfuscate_passphrase: Option<&str>,
+    tweaks: &RemoteTweaks,
     storage_base_dir: &Path,
     since: &mut SinceTracker,
     stat_cache: &mut StatCache,
@@ -463,6 +464,7 @@ async fn reconcile(
                     e2ee,
                     base_dir_prefix,
                     obfuscate_passphrase,
+                    tweaks,
                     rel_path,
                     storage_base_dir,
                     rev_tracker,
@@ -594,6 +596,7 @@ async fn execute_upload(
     e2ee: Option<&E2EEContext>,
     base_dir_prefix: &str,
     obfuscate_passphrase: Option<&str>,
+    tweaks: &RemoteTweaks,
     rel_path: &str,
     storage_base_dir: &Path,
     rev_tracker: &Arc<RevTracker>,
@@ -623,8 +626,8 @@ async fn execute_upload(
         format!("{base_dir_prefix}{rel_path}")
     };
 
-    let doc_id = path::path2id(&full_path, obfuscate_passphrase);
-    let result = chunk::disassemble(&data, rel_path, DEFAULT_PIECE_SIZE, e2ee)?;
+    let doc_id = path::path2id(&full_path, obfuscate_passphrase, tweaks.handle_filename_case_sensitive);
+    let result = chunk::disassemble(&data, rel_path, tweaks.piece_size(), tweaks.minimum_chunk_size, e2ee)?;
 
     // Write chunks (content-addressed, idempotent — outside retry loop)
     client.put_chunks(&result.chunks).await?;
@@ -835,6 +838,7 @@ pub async fn reconcile_all(
 
         let base_dir_prefix = peer.base_dir_prefix().to_string();
         let obfuscate_passphrase = peer.obfuscate_passphrase().map(String::from);
+        let tweaks = peer.tweaks().clone();
         let rev_tracker = peer.rev_tracker().clone();
         let path_cache = peer.path_cache().clone();
 
@@ -843,6 +847,7 @@ pub async fn reconcile_all(
             peer.e2ee(),
             &base_dir_prefix,
             obfuscate_passphrase.as_deref(),
+            &tweaks,
             &storage_base_dir,
             since,
             &mut stat_cache,
