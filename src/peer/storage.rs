@@ -374,3 +374,197 @@ impl StoragePeer {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    fn test_peer(base_dir: std::path::PathBuf) -> StoragePeer {
+        StoragePeer::new(StoragePeerConfig {
+            name: "test-local".into(),
+            group: "test".into(),
+            base_dir,
+            scan_offline_changes: false,
+        })
+    }
+
+    /// Collect messages from hub channel until timeout.
+    async fn collect_messages(
+        rx: &mut mpsc::Receiver<PeerMessage>,
+        timeout: Duration,
+    ) -> Vec<PeerMessage> {
+        let mut msgs = Vec::new();
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            tokio::select! {
+                _ = tokio::time::sleep_until(deadline) => break,
+                msg = rx.recv() => match msg {
+                    Some(m) => msgs.push(m),
+                    None => break,
+                },
+            }
+        }
+        msgs
+    }
+
+    /// External file creation should produce a Modified event.
+    #[tokio::test]
+    async fn watcher_detects_create() {
+        let dir = tempfile::tempdir().unwrap();
+        let peer = test_peer(dir.path().to_path_buf());
+
+        let (hub_tx, mut hub_rx) = mpsc::channel(64);
+        let (_, inbound_rx) = mpsc::channel(64);
+        let cancel = CancellationToken::new();
+
+        let handles = peer.spawn(hub_tx, inbound_rx, cancel.clone());
+
+        // Wait for watcher to be ready
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        // Create a file externally
+        tokio::fs::write(dir.path().join("hello.md"), b"hello").await.unwrap();
+
+        let msgs = collect_messages(&mut hub_rx, Duration::from_secs(2)).await;
+        cancel.cancel();
+        for h in handles { let _ = h.await; }
+
+        let created: Vec<_> = msgs.iter()
+            .filter(|m| matches!(&m.event, ChangeEvent::Modified { path, .. } if path.to_str() == Some("hello.md")))
+            .collect();
+        assert!(!created.is_empty(), "should detect file creation: got {msgs:?}");
+    }
+
+    /// External file deletion should produce a Deleted event.
+    #[tokio::test]
+    async fn watcher_detects_delete() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // Pre-create the file before starting watcher
+        let file_path = dir.path().join("to-delete.md");
+        std::fs::write(&file_path, b"content").unwrap();
+
+        let peer = test_peer(dir.path().to_path_buf());
+
+        let (hub_tx, mut hub_rx) = mpsc::channel(64);
+        let (_, inbound_rx) = mpsc::channel(64);
+        let cancel = CancellationToken::new();
+
+        let handles = peer.spawn(hub_tx, inbound_rx, cancel.clone());
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        // Delete the file externally
+        tokio::fs::remove_file(&file_path).await.unwrap();
+
+        let msgs = collect_messages(&mut hub_rx, Duration::from_secs(2)).await;
+        cancel.cancel();
+        for h in handles { let _ = h.await; }
+
+        let deleted: Vec<_> = msgs.iter()
+            .filter(|m| matches!(&m.event, ChangeEvent::Deleted { path } if path.to_str() == Some("to-delete.md")))
+            .collect();
+        assert!(!deleted.is_empty(), "should detect file deletion: got {msgs:?}");
+    }
+
+    /// `mv old new` should produce both a Deleted event for old and a Modified
+    /// event for new. This is the bug scenario: WriteTracker was suppressing the
+    /// Remove event for the old path.
+    #[tokio::test]
+    async fn watcher_detects_mv_delete() {
+        let dir = tempfile::tempdir().unwrap();
+        let subdir = dir.path().join("subfolder");
+        std::fs::create_dir_all(&subdir).unwrap();
+
+        // Pre-create the file
+        let old_path = dir.path().join("inbox-note.md");
+        std::fs::write(&old_path, b"note content").unwrap();
+
+        let peer = test_peer(dir.path().to_path_buf());
+
+        let (hub_tx, mut hub_rx) = mpsc::channel(64);
+        let (_, inbound_rx) = mpsc::channel(64);
+        let cancel = CancellationToken::new();
+
+        let handles = peer.spawn(hub_tx, inbound_rx, cancel.clone());
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        // Simulate `mv old_path new_path`
+        let new_path = subdir.join("inbox-note.md");
+        tokio::fs::rename(&old_path, &new_path).await.unwrap();
+
+        let msgs = collect_messages(&mut hub_rx, Duration::from_secs(2)).await;
+        cancel.cancel();
+        for h in handles { let _ = h.await; }
+
+        let has_delete = msgs.iter().any(|m| {
+            matches!(&m.event, ChangeEvent::Deleted { path } if path.to_str() == Some("inbox-note.md"))
+        });
+        let has_create = msgs.iter().any(|m| {
+            matches!(&m.event, ChangeEvent::Modified { path, .. } if path.to_string_lossy().contains("inbox-note.md"))
+        });
+
+        assert!(has_create, "should detect new file after mv: got {msgs:?}");
+        assert!(has_delete, "should detect deletion of old path after mv: got {msgs:?}");
+    }
+
+    /// A file written by the inbound loop (own write) then moved externally
+    /// should still produce a Deleted event for the old path. The WriteTracker
+    /// must not suppress Remove events.
+    #[tokio::test]
+    async fn watcher_mv_after_own_write_still_emits_delete() {
+        let dir = tempfile::tempdir().unwrap();
+        let subdir = dir.path().join("project");
+        std::fs::create_dir_all(&subdir).unwrap();
+
+        let peer = test_peer(dir.path().to_path_buf());
+
+        let (hub_tx, mut hub_rx) = mpsc::channel(64);
+        let (inbound_tx, inbound_rx) = mpsc::channel(64);
+        let cancel = CancellationToken::new();
+
+        let handles = peer.spawn(hub_tx, inbound_rx, cancel.clone());
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        // Simulate inbound write (bridge writes the file → recorded in WriteTracker)
+        inbound_tx
+            .send(ChangeEvent::Modified {
+                path: "synced-note.md".into(),
+                data: Arc::new(b"synced content".to_vec()),
+                mtime: 1700000000000,
+                ctime: 1700000000000,
+                is_binary: false,
+            })
+            .await
+            .unwrap();
+
+        // Wait for inbound write to complete (file written + WriteTracker recorded)
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        // Drain any echo events from the inbound write
+        let _ = collect_messages(&mut hub_rx, Duration::from_millis(500)).await;
+
+        // Now externally mv the file (user action, NOT an own write)
+        let old_path = dir.path().join("synced-note.md");
+        let new_path = subdir.join("synced-note.md");
+        assert!(old_path.exists(), "inbound write should have created the file");
+        tokio::fs::rename(&old_path, &new_path).await.unwrap();
+
+        let msgs = collect_messages(&mut hub_rx, Duration::from_secs(2)).await;
+        cancel.cancel();
+        for h in handles { let _ = h.await; }
+
+        let has_delete = msgs.iter().any(|m| {
+            matches!(&m.event, ChangeEvent::Deleted { path } if path.to_str() == Some("synced-note.md"))
+        });
+        let has_create = msgs.iter().any(|m| {
+            matches!(&m.event, ChangeEvent::Modified { path, .. } if path.to_string_lossy().contains("synced-note.md"))
+        });
+
+        assert!(has_create, "should detect new file at moved path: got {msgs:?}");
+        assert!(
+            has_delete,
+            "BUG: Remove event for old path was suppressed by WriteTracker: got {msgs:?}"
+        );
+    }
+}
