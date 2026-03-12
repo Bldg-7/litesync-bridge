@@ -534,14 +534,13 @@ async fn reconcile(
         return Ok(stats);
     }
 
-    // 6. Don't advance since if there were errors — next run will re-reconcile
+    // 6. Don't advance since or save stat cache if there were errors —
+    //    next run will re-reconcile from the same state
     if stats.errors > 0 {
         tracing::warn!(
             errors = stats.errors,
-            "reconciliation had errors, not advancing since sequence"
+            "reconciliation had errors, not persisting state"
         );
-        // Still save stat cache so successful actions aren't repeated
-        stat_cache.save().await?;
     } else {
         // Persist stat cache
         stat_cache.save().await?;
@@ -760,6 +759,11 @@ pub async fn reconcile_all(
         let mut stat_cache = StatCache::load(data_dir, &storage_name);
 
         let base_dir_prefix = peer.base_dir_prefix().to_string();
+        // Invariant: CouchDBPeer::init guarantees trailing '/' (or empty)
+        debug_assert!(
+            base_dir_prefix.is_empty() || base_dir_prefix.ends_with('/'),
+            "base_dir_prefix must be empty or end with '/'"
+        );
         let obfuscate_passphrase = peer.obfuscate_passphrase().map(String::from);
         let tweaks = peer.tweaks().clone();
         let rev_tracker = peer.rev_tracker().clone();

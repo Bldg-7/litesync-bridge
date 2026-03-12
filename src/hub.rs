@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::time::Duration;
 
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
@@ -11,6 +12,10 @@ use crate::peer::couchdb::CouchDBPeer;
 use crate::peer::storage::StoragePeer;
 use crate::reconcile::{self, InitializedPeer};
 use crate::state::StatCache;
+
+/// Timeout for sending an event to a peer's inbound channel.
+/// If a peer is slow, the hub waits up to this duration before dropping.
+const SEND_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Central dispatcher that routes change events between peers in the same group.
 pub struct Hub {
@@ -114,16 +119,22 @@ impl Hub {
                 if name.as_str() != &*msg.source_name
                     && peer_groups.get(name).map(String::as_str) == Some(&*msg.group)
                 {
-                    match tx.try_send(msg.event.clone()) {
-                        Ok(()) => {}
-                        Err(mpsc::error::TrySendError::Full(_)) => {
-                            tracing::warn!(
-                                target_peer = %name,
-                                "inbound channel full, dropping event"
-                            );
-                        }
-                        Err(mpsc::error::TrySendError::Closed(_)) => {
-                            tracing::warn!(target_peer = %name, "peer channel closed");
+                    let send_fut = tx.send(msg.event.clone());
+                    tokio::select! {
+                        _ = cancel.cancelled() => break,
+                        result = tokio::time::timeout(SEND_TIMEOUT, send_fut) => {
+                            match result {
+                                Ok(Ok(())) => {}
+                                Ok(Err(_)) => {
+                                    tracing::warn!(target_peer = %name, "peer channel closed");
+                                }
+                                Err(_) => {
+                                    tracing::error!(
+                                        target_peer = %name,
+                                        "send timed out after {SEND_TIMEOUT:?}, dropping event"
+                                    );
+                                }
+                            }
                         }
                     }
                 }

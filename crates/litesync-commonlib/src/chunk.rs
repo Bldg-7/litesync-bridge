@@ -442,6 +442,11 @@ pub fn split_text(content: &str, piece_size: usize, minimum_chunk_size: usize) -
         }
     }
 
+    // Safety net: non-empty content must never produce zero chunks
+    if pieces.is_empty() {
+        pieces.push(content.to_string());
+    }
+
     pieces
 }
 
@@ -1191,6 +1196,27 @@ mod tests {
             let reconstructed: String = pieces.join("");
             assert_eq!(reconstructed, content, "roundtrip failed for {:?} min_size={}", content, min_size);
         }
+    }
+
+    #[test]
+    fn test_split_text_nonempty_always_produces_chunks() {
+        // Safety net: even if adaptive min_size exceeds content length,
+        // non-empty content must always produce at least one chunk.
+        let content = "short";
+        let pieces = split_text(content, 1_000_000, 1_000_000);
+        assert_eq!(pieces.len(), 1);
+        assert_eq!(pieces[0], content);
+
+        // Single newline
+        let pieces = split_text("\n", 1_000_000, 1_000_000);
+        assert_eq!(pieces.len(), 1);
+        assert_eq!(pieces[0], "\n");
+
+        // Small content with newlines, very large min_size
+        let content = "a\nb\nc";
+        let pieces = split_text(content, 1_000_000, 1_000_000);
+        assert!(!pieces.is_empty());
+        assert_eq!(pieces.join(""), content);
     }
 
     #[test]

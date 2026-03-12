@@ -173,8 +173,8 @@ impl RevTracker {
     pub fn record(&self, rev: String) {
         let mut map = self.revs.lock();
         map.insert(rev, Instant::now());
-        // Periodic cleanup: every 1000 entries, sweep stale
-        if map.len() % 1000 == 0 {
+        // Sweep stale entries when the map grows beyond 1000
+        if map.len() > 1000 {
             map.retain(|_, t| t.elapsed() < REV_TTL);
         }
     }
