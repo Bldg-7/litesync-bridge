@@ -44,8 +44,11 @@ pub fn resolve_note(
     e2ee: Option<&E2EEContext>,
     change_deleted: Option<bool>,
 ) -> anyhow::Result<NoteEntry> {
-    // Deletion can come from the changes feed (ChangeResult.deleted) or the
-    // document body (_deleted). Either source is authoritative.
+    // Deletion can come from:
+    // 1. The changes feed (ChangeResult.deleted) — CouchDB-level hard delete
+    // 2. The document body (_deleted) — CouchDB tombstone flag
+    // 3. The document body (deleted: true) — Obsidian plugin soft-delete
+    // Any source is authoritative.
     let deleted = change_deleted.unwrap_or(false) || raw.is_deleted();
 
     if raw.path.starts_with(ENCRYPTED_META_PREFIX) {
@@ -367,35 +370,49 @@ pub fn split_text(content: &str, piece_size: usize, minimum_chunk_size: usize) -
     }
 
     // Phase 1: split by newline with minimum chunk length (UTF-16 code units)
+    //
+    // Replicates TS `splitByDelimiterWithMinLength(source, "\n", minSize)`:
+    //   - Find each "\n" individually via indexOf("\n", prev)
+    //   - Append everything from prev up to and including the "\n" to buf
+    //   - If buf.length > minimumChunkLength (strictly greater), yield buf
+    //   - After exhausting source, yield any remaining buf
     let mut segments = Vec::new();
     let mut buf = String::new();
     let mut buf_utf16_len: usize = 0;
 
-    let mut chars = content.char_indices().peekable();
-    let mut start = 0;
-    while let Some((i, ch)) = chars.next() {
-        if ch == '\n' {
-            // Consume consecutive newlines
-            let mut end = i + 1;
-            while let Some(&(next_i, '\n')) = chars.peek() {
-                end = next_i + 1;
-                chars.next();
-            }
-            let slice = &content[start..end];
-            buf.push_str(slice);
-            buf_utf16_len += slice.chars().map(|c| c.len_utf16()).sum::<usize>();
-            start = end;
+    // We process the content as a single source string, finding each '\n' one at a time
+    let bytes = content.as_bytes();
+    let mut prev = 0; // byte offset of current unprocessed start
 
-            if buf_utf16_len >= min_size {
-                segments.push(std::mem::take(&mut buf));
-                buf_utf16_len = 0;
+    loop {
+        // Find the next '\n' starting from prev
+        let nl_pos = bytes[prev..].iter().position(|&b| b == b'\n');
+        match nl_pos {
+            Some(rel_pos) => {
+                // Absolute byte position of the '\n'
+                let abs_pos = prev + rel_pos;
+                // Slice from prev up to and including the '\n'
+                let slice = &content[prev..abs_pos + 1];
+                buf.push_str(slice);
+                buf_utf16_len += slice.chars().map(|c| c.len_utf16()).sum::<usize>();
+                prev = abs_pos + 1;
+
+                // TS uses strictly greater than: `if (buf.length > minimumChunkLength)`
+                if buf_utf16_len > min_size {
+                    segments.push(std::mem::take(&mut buf));
+                    buf_utf16_len = 0;
+                }
+            }
+            None => {
+                // No more newlines — append remainder to buf
+                if prev < content.len() {
+                    buf.push_str(&content[prev..]);
+                }
+                break;
             }
         }
     }
-    // Remaining content
-    if start < content.len() {
-        buf.push_str(&content[start..]);
-    }
+
     if !buf.is_empty() {
         segments.push(buf);
     }
@@ -465,26 +482,25 @@ pub fn split_binary(content: &[u8], piece_size: usize, filename: &str) -> Vec<St
         let default_split_end = (i + piece_size).min(size);
 
         let split_end = if find_start < size {
-            // Look for delimiter after minimum chunk size
-            let mut found = None;
-            for pos in find_start..default_split_end.min(size) {
-                if content[pos] == delimiter {
-                    found = Some(pos);
-                    break;
-                }
-            }
-            if found.is_none() {
-                // Fallback: look for newline
-                for pos in find_start..default_split_end.min(size) {
-                    if content[pos] == b'\n' {
-                        found = Some(pos);
-                        break;
-                    }
-                }
-            }
-            match found {
-                Some(pos) if pos < default_split_end => pos,
-                _ => default_split_end,
+            // Replicate TS: buf.indexOf(delimiter, findStart) searches the
+            // ENTIRE remaining buffer, not just up to defaultSplitEnd.
+            // Only if the delimiter is not found anywhere do we fall back to newline.
+            let delim_pos = content[find_start..].iter().position(|&b| b == delimiter)
+                .map(|rel| find_start + rel);
+
+            let found_pos = if delim_pos.is_some() {
+                // Delimiter exists somewhere — use it (will be capped below)
+                delim_pos
+            } else {
+                // Delimiter not found anywhere — fall back to newline search
+                // (also searches entire remaining buffer)
+                content[find_start..].iter().position(|&b| b == b'\n')
+                    .map(|rel| find_start + rel)
+            };
+
+            match found_pos {
+                Some(pos) => pos.min(default_split_end),
+                None => default_split_end,
             }
         } else {
             default_split_end
@@ -625,6 +641,8 @@ mod tests {
             children: vec!["h:c1".into(), "h:c2".into()],
             eden: HashMap::new(),
             _deleted: None,
+            deleted: None,
+            data: None,
         }
     }
 
@@ -711,6 +729,27 @@ mod tests {
         let mut raw = make_raw("x.md", TYPE_PLAIN);
         raw._deleted = Some(true);
         let note = resolve_note(&raw, None, Some(false)).unwrap();
+        assert!(note.deleted);
+    }
+
+    #[test]
+    fn test_resolve_note_soft_deleted_from_body() {
+        // Obsidian plugin soft-delete: body `deleted: true` (not `_deleted`)
+        let mut raw = make_raw("x.md", TYPE_NEWNOTE);
+        raw.deleted = Some(true);
+        raw.children = vec![];
+        raw.size = 0;
+        raw.data = Some("".into());
+        let note = resolve_note(&raw, None, Some(false)).unwrap();
+        assert!(note.deleted);
+    }
+
+    #[test]
+    fn test_resolve_note_soft_deleted_not_hard_deleted() {
+        // Soft-deleted doc is NOT a CouchDB tombstone — change_deleted is None/false
+        let mut raw = make_raw("x.md", TYPE_NEWNOTE);
+        raw.deleted = Some(true);
+        let note = resolve_note(&raw, None, None).unwrap();
         assert!(note.deleted);
     }
 
@@ -1035,6 +1074,169 @@ mod tests {
             .flat_map(|p| BASE64.decode(p).unwrap())
             .collect();
         assert_eq!(decoded, data);
+    }
+
+    // =====================================================================
+    // H3/H4/H5 regression tests: TS compatibility for chunk splitting
+    // =====================================================================
+
+    #[test]
+    fn test_split_text_h3_strict_greater_than() {
+        // H3: TS uses `buf.length > minimumChunkLength` (strictly greater).
+        // With min_size=5 and content "abcde\nfgh", the buffer after the \n
+        // has length 6 ("abcde\n"), which is > 5, so it should split.
+        // With >=, a buffer of exactly 5 would also split; with >, it should not.
+        //
+        // Content: "abcd\nefgh" — buf after first \n = "abcd\n" = 5 chars
+        // With > 5: does NOT split (5 is not > 5), yields one segment
+        // With >= 5: WOULD split, yielding two segments
+        let pieces = split_text("abcd\nefgh", 1000, 5);
+        // "abcd\n" has length 5, which is NOT > 5, so no split occurs.
+        // The whole string should be one segment.
+        assert_eq!(pieces.len(), 1, "buf of exactly min_size should NOT split (> not >=)");
+        assert_eq!(pieces[0], "abcd\nefgh");
+
+        // One more char makes it > 5 → should split
+        let pieces2 = split_text("abcde\nfgh", 1000, 5);
+        // "abcde\n" has length 6, which IS > 5 → splits
+        assert_eq!(pieces2.len(), 2);
+        assert_eq!(pieces2[0], "abcde\n");
+        assert_eq!(pieces2[1], "fgh");
+    }
+
+    #[test]
+    fn test_split_text_h4_consecutive_newlines_individual() {
+        // H4: TS processes each \n individually via indexOf("\n", prev).
+        // Each \n is a potential split boundary.
+        //
+        // Content: "a\n\n\nb" with min_size=2
+        // TS behavior step-by-step (splitByDelimiterWithMinLength):
+        //   prev=0, find \n at 1: buf = "a\n" (len=2, NOT > 2) → no yield
+        //   prev=2, find \n at 2: buf = "a\n\n" (len=3, IS > 2) → yield "a\n\n"
+        //   prev=3, find \n at 3: buf = "\n" (len=1, NOT > 2) → no yield
+        //   no more \n: buf += "b" → buf = "\nb" → yield "\nb"
+        let pieces = split_text("a\n\n\nb", 1000, 2);
+        assert_eq!(pieces, vec!["a\n\n", "\nb"]);
+    }
+
+    #[test]
+    fn test_split_text_h4_many_consecutive_newlines() {
+        // Verify each \n is checked individually with a larger example.
+        // "xx\n\n\n\nyy" with min_size=3
+        // prev=0, find \n at 2: buf = "xx\n" (len=3, NOT > 3) → no yield
+        // prev=3, find \n at 3: buf = "xx\n\n" (len=4, IS > 3) → yield "xx\n\n"
+        // prev=4, find \n at 4: buf = "\n" (len=1, NOT > 3)
+        // prev=5, find \n at 5: buf = "\n\n" (len=2, NOT > 3)
+        // no more \n: buf += "yy" → buf = "\n\nyy" → yield "\n\nyy"
+        let pieces = split_text("xx\n\n\n\nyy", 1000, 3);
+        assert_eq!(pieces, vec!["xx\n\n", "\n\nyy"]);
+    }
+
+    #[test]
+    fn test_split_text_h4_all_newlines() {
+        // Edge case: content is entirely newlines
+        // "\n\n\n\n" with min_size=2
+        // prev=0, \n at 0: buf="\n" (1, not > 2)
+        // prev=1, \n at 1: buf="\n\n" (2, not > 2)
+        // prev=2, \n at 2: buf="\n\n\n" (3, > 2) → yield "\n\n\n"
+        // prev=3, \n at 3: buf="\n" (1, not > 2)
+        // no more \n, no remaining content → yield "\n"
+        let pieces = split_text("\n\n\n\n", 1000, 2);
+        assert_eq!(pieces, vec!["\n\n\n", "\n"]);
+    }
+
+    #[test]
+    fn test_split_text_h3_h4_combined_roundtrip() {
+        // Ensure all split_text results concatenate back to original
+        let inputs = vec![
+            ("a\n\n\nb", 2),
+            ("hello\n\n\n\nworld\n", 5),
+            ("\n\n\n\n\n", 3),
+            ("no-newlines-here", 5),
+            ("x\ny\nz\n", 1),
+        ];
+        for (content, min_size) in inputs {
+            let pieces = split_text(content, 1000, min_size);
+            let reconstructed: String = pieces.join("");
+            assert_eq!(reconstructed, content, "roundtrip failed for {:?} min_size={}", content, min_size);
+        }
+    }
+
+    #[test]
+    fn test_split_binary_h5_delimiter_beyond_default_split_end() {
+        // H5: When delimiter exists beyond defaultSplitEnd, TS does NOT fall
+        // back to newline search — it just uses defaultSplitEnd.
+        //
+        // Setup: content where a newline exists within [findStart, defaultSplitEnd)
+        // but the delimiter (null byte) only exists BEYOND defaultSplitEnd.
+        // The old buggy code would find the newline; correct code should NOT.
+        //
+        // For a .json file with small data, minimum_chunk_size = 100 (see formula).
+        // For a generic binary, minimum_chunk_size = 100_000 which is hard to test.
+        // Use .json so minimum is 100.
+        //
+        // piece_size=200, so defaultSplitEnd = 0 + 200 = 200
+        // findStart = 0 + 100 = 100
+        // Place a \n at position 120, and a comma at position 250.
+        //
+        // TS: searches entire buffer for comma from pos 100. Finds it at 250.
+        //     Since 250 > -1, does NOT fall back to newline.
+        //     splitEnd = min(250, 200) = 200.
+        // Buggy Rust: searches [100,200) for comma. Not found. Falls back to
+        //     newline search in [100,200). Finds \n at 120. splitEnd = 120.
+        let mut data = vec![b'A'; 300];
+        data[120] = b'\n'; // newline within search window
+        data[250] = b','; // comma (json delimiter) beyond defaultSplitEnd
+
+        let pieces = split_binary(&data, 200, "data.json");
+        let decoded: Vec<u8> = pieces.iter()
+            .flat_map(|p| BASE64.decode(p).unwrap())
+            .collect();
+        assert_eq!(decoded, data, "roundtrip must hold");
+
+        // First chunk should be 200 bytes (defaultSplitEnd), NOT 120 bytes (newline)
+        let first_chunk = BASE64.decode(&pieces[0]).unwrap();
+        assert_eq!(first_chunk.len(), 200,
+            "delimiter exists beyond window, so should NOT fall back to newline; \
+             expected first chunk of 200 bytes, got {}", first_chunk.len());
+    }
+
+    #[test]
+    fn test_split_binary_h5_delimiter_within_window_still_works() {
+        // When delimiter IS within the window, it should still be used.
+        // .json with piece_size=200, minimum=100.
+        // Place comma at position 150 (within [100, 200)).
+        let mut data = vec![b'A'; 300];
+        data[150] = b',';
+
+        let pieces = split_binary(&data, 200, "data.json");
+        let decoded: Vec<u8> = pieces.iter()
+            .flat_map(|p| BASE64.decode(p).unwrap())
+            .collect();
+        assert_eq!(decoded, data);
+
+        // First chunk should be 150 bytes (split at the comma position)
+        let first_chunk = BASE64.decode(&pieces[0]).unwrap();
+        assert_eq!(first_chunk.len(), 150);
+    }
+
+    #[test]
+    fn test_split_binary_h5_no_delimiter_anywhere_uses_newline() {
+        // When delimiter is NOT found anywhere in remaining buffer,
+        // TS falls back to newline. Place \n at 130, no commas at all.
+        let mut data = vec![b'A'; 300];
+        data[130] = b'\n';
+        // No comma anywhere
+
+        let pieces = split_binary(&data, 200, "data.json");
+        let decoded: Vec<u8> = pieces.iter()
+            .flat_map(|p| BASE64.decode(p).unwrap())
+            .collect();
+        assert_eq!(decoded, data);
+
+        // First chunk should split at the newline (130 bytes)
+        let first_chunk = BASE64.decode(&pieces[0]).unwrap();
+        assert_eq!(first_chunk.len(), 130);
     }
 
     // =====================================================================

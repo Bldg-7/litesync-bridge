@@ -103,6 +103,16 @@ pub fn should_be_ignored(filename: &str) -> bool {
         || filename.starts_with("LIVESYNC_LOG_")
 }
 
+/// Whether a resolved path refers to an internal LiveSync document.
+///
+/// The Obsidian LiveSync plugin stores internal documents (e.g. `ps:`, `i:`,
+/// `ix:` prefixed paths) in CouchDB alongside regular file documents.  These
+/// should never be written to the local filesystem.  The TS plugin's
+/// `PeerCouchDB` filters them out with `entry.path.indexOf(":") !== -1`.
+pub fn is_internal_livesync_path(path: &str) -> bool {
+    path.contains(':')
+}
+
 /// Strip all prefixes (e.g., "ps:" or "i:") from a path.
 pub fn strip_all_prefixes(path: &str) -> &str {
     match path.split_once(':') {
@@ -479,5 +489,27 @@ mod tests {
         assert_eq!(strip_all_prefixes("ps:notes/hello.md"), "notes/hello.md");
         assert_eq!(strip_all_prefixes("a:b:c/d.md"), "c/d.md");
         assert_eq!(strip_all_prefixes("hello.md"), "hello.md");
+    }
+
+    // =====================================================================
+    // is_internal_livesync_path — filters internal LiveSync documents
+    // =====================================================================
+
+    #[test]
+    fn test_is_internal_livesync_path_with_prefixes() {
+        // Internal LiveSync documents have colon-prefixed paths
+        assert!(is_internal_livesync_path("ps:settings"));
+        assert!(is_internal_livesync_path("i:some_index"));
+        assert!(is_internal_livesync_path("ix:some_index"));
+        assert!(is_internal_livesync_path("h:chunk_hash"));
+    }
+
+    #[test]
+    fn test_is_internal_livesync_path_regular_files() {
+        // Regular file paths should not be filtered
+        assert!(!is_internal_livesync_path("notes/hello.md"));
+        assert!(!is_internal_livesync_path("subfolder/image.png"));
+        assert!(!is_internal_livesync_path("README.md"));
+        assert!(!is_internal_livesync_path(""));
     }
 }

@@ -7,6 +7,7 @@ use tokio_util::sync::CancellationToken;
 
 use litesync_commonlib::chunk::{self, E2EEContext};
 use litesync_commonlib::couchdb::{CouchDBClient, RemoteTweaks};
+use litesync_commonlib::crypto;
 use litesync_commonlib::doc::{RawNoteEntry, TYPE_NEWNOTE, TYPE_PLAIN};
 use litesync_commonlib::path;
 
@@ -316,7 +317,10 @@ pub async fn fetch_remote_entries(
             None => continue,
         };
 
-        if path::should_be_ignored(&rel_path) || is_hidden_path(&rel_path) {
+        if path::is_internal_livesync_path(&rel_path)
+            || path::should_be_ignored(&rel_path)
+            || is_hidden_path(&rel_path)
+        {
             continue;
         }
 
@@ -327,7 +331,7 @@ pub async fn fetch_remote_entries(
                 doc_id: change.id.clone(),
                 mtime: note.mtime,
                 size: note.size,
-                deleted: false,
+                deleted: note.deleted,
             },
         );
     }
@@ -349,7 +353,10 @@ fn resolve_deleted_path_static(
         if let Ok(raw) = serde_json::from_value::<RawNoteEntry>(val.clone()) {
             if let Ok(note) = chunk::resolve_note(&raw, e2ee, Some(true)) {
                 if let Some(rel) = apply_base_dir_filter(base_dir_prefix, &note.path) {
-                    if !path::should_be_ignored(&rel) && !is_hidden_path(&rel) {
+                    if !path::is_internal_livesync_path(&rel)
+                        && !path::should_be_ignored(&rel)
+                        && !is_hidden_path(&rel)
+                    {
                         return Some(rel);
                     }
                 }
@@ -360,7 +367,10 @@ fn resolve_deleted_path_static(
     // Strategy 2: Try reversing the doc ID (works for non-obfuscated IDs)
     if let Ok(full_path) = path::id2path(doc_id, None) {
         if let Some(rel) = apply_base_dir_filter(base_dir_prefix, &full_path) {
-            if !path::should_be_ignored(&rel) && !is_hidden_path(&rel) {
+            if !path::is_internal_livesync_path(&rel)
+                && !path::should_be_ignored(&rel)
+                && !is_hidden_path(&rel)
+            {
                 return Some(rel);
             }
         }
@@ -502,7 +512,9 @@ async fn reconcile(
                 }
             }
             ReconcileAction::DeleteRemote { rel_path, doc_id } => {
-                match execute_delete_remote(client, doc_id, rev_tracker).await {
+                match execute_delete_remote(
+                    client, e2ee, base_dir_prefix, doc_id, rel_path, rev_tracker,
+                ).await {
                     Ok(()) => {
                         stat_cache.remove(rel_path);
                         stats.deleted_remote += 1;
@@ -708,22 +720,66 @@ async fn execute_upload(
 
 async fn execute_delete_remote(
     client: &CouchDBClient,
+    e2ee: Option<&E2EEContext>,
+    base_dir_prefix: &str,
     doc_id: &str,
+    rel_path: &str,
     rev_tracker: &Arc<RevTracker>,
 ) -> anyhow::Result<()> {
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+
+    let full_path = if base_dir_prefix.is_empty() {
+        rel_path.to_string()
+    } else {
+        format!("{base_dir_prefix}{rel_path}")
+    };
+
     for attempt in 0..MAX_CONFLICT_RETRIES {
-        let doc: serde_json::Value = match client.get_doc(doc_id).await {
+        let existing: serde_json::Value = match client.get_doc(doc_id).await {
             Ok(d) => d,
             Err(e) if is_not_found(&e) => return Ok(()),
             Err(e) => return Err(e),
         };
 
-        let rev = doc
+        let rev = existing
             .get("_rev")
             .and_then(|v| v.as_str())
             .ok_or_else(|| anyhow::anyhow!("missing _rev on {doc_id}"))?;
 
-        match client.delete_doc(doc_id, rev).await {
+        // Soft-delete: PUT the document back with `deleted: true`,
+        // matching the Obsidian LiveSync plugin protocol.
+        let (path_field, doc_mtime) = if let Some(ctx) = e2ee {
+            let encrypted = crypto::encrypt_meta(
+                &full_path,
+                now_ms,
+                0,  // ctime
+                0,  // size
+                &[], // children
+                &ctx.master_key,
+            )?;
+            (encrypted, 0u64)
+        } else {
+            (full_path.clone(), now_ms)
+        };
+
+        let doc = serde_json::json!({
+            "_id": doc_id,
+            "_rev": rev,
+            "type": TYPE_NEWNOTE,
+            "path": path_field,
+            "ctime": 0u64,
+            "mtime": doc_mtime,
+            "size": 0u64,
+            "children": Vec::<String>::new(),
+            "eden": {},
+            "data": "",
+            "deleted": true,
+        });
+
+        match client.put_doc(doc_id, &doc).await {
             Ok(resp) => {
                 rev_tracker.record(resp.rev);
                 return Ok(());
@@ -731,7 +787,7 @@ async fn execute_delete_remote(
             Err(e) if attempt < MAX_CONFLICT_RETRIES - 1 && is_conflict(&e) => {
                 tracing::debug!(
                     doc_id = %doc_id, attempt,
-                    "409 conflict on reconciliation delete, retrying"
+                    "409 conflict on reconciliation soft-delete, retrying"
                 );
                 continue;
             }
@@ -1228,5 +1284,24 @@ mod tests {
         // Trailing dot is NOT hidden
         assert!(!is_hidden_path("file.md"));
         assert!(!is_hidden_path("a/b.md"));
+    }
+
+    // ── Internal LiveSync path filtering ─────────────────────────────────
+
+    #[test]
+    fn resolve_deleted_path_static_skips_internal_docs() {
+        // Internal LiveSync documents with colon prefixes should be filtered out.
+        // Strategy 2 (id2path) is tested here: doc IDs like "ps:settings"
+        // resolve to paths containing ":" and must be rejected.
+        assert!(resolve_deleted_path_static("ps:settings", None, None, "").is_none());
+        assert!(resolve_deleted_path_static("i:some_index", None, None, "").is_none());
+        assert!(resolve_deleted_path_static("ix:some_index", None, None, "").is_none());
+    }
+
+    #[test]
+    fn resolve_deleted_path_static_allows_regular_docs() {
+        // Regular file paths should pass through strategy 2 (id2path).
+        let result = resolve_deleted_path_static("notes/hello.md", None, None, "");
+        assert_eq!(result, Some("notes/hello.md".to_string()));
     }
 }

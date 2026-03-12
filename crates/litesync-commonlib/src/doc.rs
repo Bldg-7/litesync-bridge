@@ -62,6 +62,15 @@ pub struct RawNoteEntry {
     pub eden: HashMap<String, EdenChunk>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub _deleted: Option<bool>,
+    /// Soft-delete flag set by the Obsidian plugin. When `true`, the document
+    /// represents a deleted file but is NOT a CouchDB tombstone — it remains
+    /// visible in the changes feed so other clients can detect the deletion.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deleted: Option<bool>,
+    /// Optional inline data field. Present on soft-deleted documents (empty
+    /// string) and sometimes on plain-text notes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub data: Option<String>,
 }
 
 /// Metadata decrypted from an encrypted path field.
@@ -104,7 +113,7 @@ impl RawNoteEntry {
     }
 
     pub fn is_deleted(&self) -> bool {
-        self._deleted.unwrap_or(false)
+        self._deleted.unwrap_or(false) || self.deleted.unwrap_or(false)
     }
 }
 
@@ -265,6 +274,8 @@ mod tests {
             children: vec![],
             eden: HashMap::new(),
             _deleted: None,
+            deleted: None,
+            data: None,
         }
     }
 
@@ -289,6 +300,40 @@ mod tests {
         assert!(!entry.is_deleted());
         entry._deleted = Some(true);
         assert!(entry.is_deleted());
+    }
+
+    #[test]
+    fn test_is_deleted_soft_delete() {
+        // Body-level `deleted: true` (soft-delete from Obsidian plugin)
+        let mut entry = make_entry("plain", "x");
+        assert!(!entry.is_deleted());
+        entry.deleted = Some(true);
+        assert!(entry.is_deleted());
+        // Both false → not deleted
+        entry.deleted = Some(false);
+        entry._deleted = Some(false);
+        assert!(!entry.is_deleted());
+    }
+
+    #[test]
+    fn test_soft_delete_deserialization() {
+        let json = r#"{
+            "_id": "notes/deleted.md",
+            "_rev": "5-abc",
+            "type": "newnote",
+            "path": "notes/deleted.md",
+            "deleted": true,
+            "children": [],
+            "mtime": 1700000000000,
+            "size": 0,
+            "data": ""
+        }"#;
+        let entry: RawNoteEntry = serde_json::from_str(json).unwrap();
+        assert_eq!(entry.deleted, Some(true));
+        assert_eq!(entry.data, Some("".into()));
+        assert!(entry.is_deleted());
+        assert!(entry.children.is_empty());
+        assert_eq!(entry.size, 0);
     }
 
     #[test]

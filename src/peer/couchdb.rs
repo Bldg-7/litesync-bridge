@@ -11,6 +11,7 @@ use litesync_commonlib::couchdb::{CouchDBClient, CouchDBHttpError, RemoteTweaks}
 use litesync_commonlib::crypto;
 use litesync_commonlib::doc::{RawNoteEntry, TYPE_NEWNOTE, TYPE_PLAIN};
 use litesync_commonlib::path;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::bridge::{ChangeEvent, PeerMessage};
 use crate::config::CouchDBPeerConfig;
@@ -319,7 +320,10 @@ impl CouchDBPeer {
             if let Ok(raw) = serde_json::from_value::<RawNoteEntry>(val.clone()) {
                 if let Ok(note) = chunk::resolve_note(&raw, self.e2ee.as_ref(), Some(true)) {
                     if let Some(rel) = self.apply_base_dir_filter(&note.path) {
-                        if !path::should_be_ignored(&rel) && !is_hidden_path(&rel) {
+                        if !path::is_internal_livesync_path(&rel)
+                            && !path::should_be_ignored(&rel)
+                            && !is_hidden_path(&rel)
+                        {
                             return Some(rel);
                         }
                     }
@@ -330,7 +334,10 @@ impl CouchDBPeer {
         // Strategy 2: Try reversing the doc ID (works for non-obfuscated IDs)
         if let Ok(full_path) = path::id2path(doc_id, None) {
             if let Some(rel) = self.apply_base_dir_filter(&full_path) {
-                if !path::should_be_ignored(&rel) && !is_hidden_path(&rel) {
+                if !path::is_internal_livesync_path(&rel)
+                    && !path::should_be_ignored(&rel)
+                    && !is_hidden_path(&rel)
+                {
                     return Some(rel);
                 }
             }
@@ -368,7 +375,10 @@ impl CouchDBPeer {
             None => return Ok(None),
         };
 
-        if path::should_be_ignored(&rel_path) || is_hidden_path(&rel_path) {
+        if path::is_internal_livesync_path(&rel_path)
+            || path::should_be_ignored(&rel_path)
+            || is_hidden_path(&rel_path)
+        {
             return Ok(None);
         }
 
@@ -541,9 +551,14 @@ impl CouchDBPeer {
                 let doc_id =
                     path::path2id(&full_path, self.obfuscate_passphrase.as_deref(), self.case_sensitive);
 
+                let now_ms = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis() as u64;
+
                 for attempt in 0..MAX_CONFLICT_RETRIES {
-                    // Fetch current _rev (required for CouchDB delete)
-                    let doc: serde_json::Value = match self.client.get_doc(&doc_id).await {
+                    // Fetch current doc for _rev (required for CouchDB update)
+                    let existing: serde_json::Value = match self.client.get_doc(&doc_id).await {
                         Ok(d) => d,
                         Err(e) if is_not_found(&e) => {
                             // Already deleted
@@ -562,16 +577,49 @@ impl CouchDBPeer {
                         }
                     };
 
-                    let rev = doc
+                    let rev = existing
                         .get("_rev")
                         .and_then(|v| v.as_str())
                         .ok_or_else(|| anyhow::anyhow!("missing _rev on {doc_id}"))?;
 
-                    match self.client.delete_doc(&doc_id, rev).await {
+                    // Soft-delete: PUT the document back with `deleted: true`,
+                    // matching the Obsidian LiveSync plugin protocol. This keeps
+                    // the document visible in the changes feed so other clients
+                    // can detect the deletion.
+                    let (path_field, doc_mtime) = if let Some(ref ctx) = self.e2ee {
+                        let encrypted = crypto::encrypt_meta(
+                            &full_path,
+                            now_ms,
+                            0,  // ctime
+                            0,  // size
+                            &[], // children
+                            &ctx.master_key,
+                        )?;
+                        (encrypted, 0u64)
+                    } else {
+                        (full_path.clone(), now_ms)
+                    };
+
+                    let doc = serde_json::json!({
+                        "_id": doc_id,
+                        "_rev": rev,
+                        "type": TYPE_NEWNOTE,
+                        "path": path_field,
+                        "ctime": 0u64,
+                        "mtime": doc_mtime,
+                        "size": 0u64,
+                        "children": Vec::<String>::new(),
+                        "eden": {},
+                        "data": "",
+                        "deleted": true,
+                    });
+
+                    match self.client.put_doc(&doc_id, &doc).await {
                         Ok(resp) => {
-                            self.rev_tracker.record(resp.rev);
+                            self.rev_tracker.record(resp.rev.clone());
                             tracing::debug!(
-                                peer = %self.name, path = %filename, "deleted document"
+                                peer = %self.name, path = %filename,
+                                rev = %resp.rev, "soft-deleted document"
                             );
                             break;
                         }
@@ -581,7 +629,7 @@ impl CouchDBPeer {
                         {
                             tracing::debug!(
                                 peer = %self.name, doc_id = %doc_id,
-                                attempt, "409 conflict on delete, retrying"
+                                attempt, "409 conflict on soft-delete, retrying"
                             );
                             continue;
                         }
