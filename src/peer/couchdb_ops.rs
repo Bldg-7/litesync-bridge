@@ -94,6 +94,9 @@ pub(crate) async fn upload_to_couchdb(
             "children": doc_children,
             "eden": existing_eden,
         });
+        if e2ee.is_some() {
+            doc["e_"] = serde_json::json!(true);
+        }
         if let Some(rev) = existing_rev {
             doc["_rev"] = serde_json::json!(rev);
         }
@@ -164,7 +167,7 @@ pub(crate) async fn soft_delete_from_couchdb(
             (full_path.to_string(), now_ms)
         };
 
-        let doc = serde_json::json!({
+        let mut doc = serde_json::json!({
             "_id": doc_id,
             "_rev": rev,
             "type": TYPE_NEWNOTE,
@@ -178,6 +181,9 @@ pub(crate) async fn soft_delete_from_couchdb(
             "data": "",
             "deleted": true,
         });
+        if e2ee.is_some() {
+            doc["e_"] = serde_json::json!(true);
+        }
 
         match client.put_doc(doc_id, &doc).await {
             Ok(resp) => {
